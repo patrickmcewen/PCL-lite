@@ -1,5 +1,5 @@
 from reinforce.base import Storage
-from reinforce.agents import QueryImpl, QueryPyBody, QueryAffineImpl, QueryAffineImplTwoStages, QueryAffinePyBody, prepare_prompt_query_impl, prepare_prompt_query_impl_with_feedback, prepare_prompt_eliminate_identity, prepare_prompt_query_py_body, prepare_prompt_query_affine_rewrite, prepare_prompt_affine_impl_stage_0
+from reinforce.agents import QueryImpl, QueryPyBody, QueryAffineImpl, QueryAffinePyBody, prepare_prompt_query_impl, prepare_prompt_query_impl_with_feedback, prepare_prompt_eliminate_identity, prepare_prompt_query_py_body, prepare_prompt_query_affine_rewrite
 from tools import yaml_to_code
 import yaml
 import json
@@ -134,27 +134,6 @@ def query_affine_impl_once(key: str, config_dict: dict, config: Storage, storage
     agent.log_yaml_list(storage.retrieve(key)["success"], "success_impl")
     agent.log_yaml_list(storage.retrieve(key)["failure_rep"], "failure_impl_rep")
     agent.log_yaml_list(storage.retrieve(key)["success_rep"], "success_impl_rep")
-
-def query_affine_impl_two_stages(key: str, config_dict: dict, config: Storage, storage: Storage):
-    config.store(key, config_dict)
-    agent = QueryAffineImplTwoStages(key, config)
-    with open(agent.config.retrieve(key)["task_path"], "r") as f:
-        task_str = f.read()
-        task_data = yaml.safe_load(task_str)
-        storage.store(key, {"task": task_data})
-    prompt = prepare_prompt_affine_impl_stage_0(key, config, storage)
-    with open(os.path.join(agent.config.retrieve(key)["temp_dir"], "prompt_stage_0.md"), "w") as f:
-        f.write(prompt)
-    agent.run(storage)
-    agent.deduplicate_failure(storage)
-    agent.deduplicate_success(storage)
-    config.dump(os.path.join(agent.config.retrieve(key)["temp_dir"], "config.yaml"))
-    agent.log_yaml_list(storage.retrieve(key)["failure"], "failure_impl")
-    agent.log_yaml_list(storage.retrieve(key)["success"], "success_impl")
-    agent.log_yaml_list(storage.retrieve(key)["failure_rep"], "failure_impl_rep")
-    agent.log_yaml_list(storage.retrieve(key)["success_rep"], "success_impl_rep")
-    agent.log_md_list(storage.retrieve(key)["success_prompt_1"], "success_stage_1_prompt")
-    agent.log_md_list(storage.retrieve(key)["failure_prompt_1"], "failure_stage_1_prompt")
 
 def compose_example_with_helpers(ori_example_path, new_example_path, helpers_path, helper_task_path_list, helper_impl_path_list):
     # Assemble helpers

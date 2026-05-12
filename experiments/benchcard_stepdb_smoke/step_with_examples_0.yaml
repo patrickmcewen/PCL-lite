@@ -12,29 +12,15 @@ general:
 
       • `graph` is the `step.Graph()` that the harness creates and threads
         through every node.
-      • Each `Ei` arg is a **raw `torch.Tensor`** — the underlying for the
-        YAML input named `Ei`. The body is responsible for picking a source
-        op per input and applying it before any compute ops can consume it.
-        The codegen emits a `# Inputs:` comment block immediately above your
-        `def body(...)` listing each arg's dtype and PCL-lite dims so you can
-        choose the right loader.
+      • Each `Ei` is a `step.LinearOffChipLoad` source op produced by the
+        codegen's `prepare(graph)` for the input named `Ei` in the YAML.
+        Default tiling is `tile_row=1, tile_col=<innermost dim>`, so the
+        resulting stream has shape `(1, *outer_dims, 1)` and tile dtype
+        `Tile(1, inner_dim)`.
       • Compose `step.*` ops; each compute/transform op takes `graph` as its
         first argument and returns a new node consumed by reference.
       • The body MUST end with `return step.OffChipStore(graph, <last_node>,
         par_dispatch=1)`. For multiple outputs return a tuple of stores.
-
-    HARD CONSTRAINT — no torch-to-step bypass. Every reference to an input
-    tensor (whether the bare `Ei` arg or `input_data['Ei']`) must appear
-    inside the `underlying=` / `tensor=` kwarg expression of a source-op
-    call (`LinearOffChipLoad`, `SelectGen`, `RandomOffChipLoad`,
-    `DynLinearOffChipLoad`). Tensor-view methods on the input
-    (`.reshape`, `.view`, `.permute`, `.unsqueeze`, …) inside that kwarg
-    are fine. Passing a raw input tensor to `torch.*` math, the `@`
-    matmul operator, indexing, or any helper function is rejected by a
-    static gate before pytest — there is no point computing the answer
-    in plain torch and wrapping it in a load. After
-    `Ei = step.SourceOp(underlying=Ei, ...)` the name `Ei` is a stream
-    and may flow into any `step.*` op unrestricted.
 
     The harness then runs `step.execute(graph, store, input_tensors={})` and
     flat-compares the result (always a 2-D un-tiled tensor) against the
@@ -44,43 +30,20 @@ general:
     Module-level symbols available in scope:
       - `step` (the step_tl shim)
       - `torch`
-      - `input_data` (dict of raw torch tensors, keyed by input name —
-        identical to the positional body args, exposed for use inside
-        compute-side helpers like map_fn closures)
+      - `input_data` (dict of raw torch tensors, keyed by input name)
       - Per-symbol value constants: `M_value, N_value, K_value, D_value` (= 5,
         7, 9, 16) and the sympy Symbols `M, N, K, D` for shape derivation.
-
-    Source-op catalog (pick one per input, driven by the input's declared
-    dtype in the `# Inputs:` table):
-
-      - `step.LinearOffChipLoad(underlying=Ei, stride, out_shape_tiled,
-        tile_row, tile_col, par_dispatch=1)`
-        Tile and stream a fixed-stride tensor. Use for fp32/fp16/uint64
-        underlyings. Default tiling `tile_row=1, tile_col=<innermost dim>`
-        gives stream shape `(1, *outer_dims, 1)` with tile dtype
-        `Tile(1, inner_dim)`. Underlying must be rank>=2; reshape 1-D
-        tensors with `Ei.reshape(1, N_value)` first.
-
-      - `step.SelectGen(is_multihot=True, tensor=Ei, n=<E>_value)`
-        Load a fp32 underlying of shape `(*outer_dims, E)` as a stream of
-        `MultiHot(E)` rows. Use for one-hot routing tensors like
-        `expert_onehot` (declared dtype `Multihot(fp32, E)`). Output stream
-        shape is `(1,) + tensor.shape[:-1]`. Use `is_multihot=False` for
-        `Index(n)` streams instead.
-
-      - `step.RandomOffChipLoad(graph, underlying=Ei, raddr=<addr-stream>,
-        tile_row, tile_col, base_addr_byte, par_dispatch=1)`
-        Gather-style indirect load driven by an address stream. fp32/fp16
-        only (no uint64).
-
-      - `step.DynLinearOffChipLoad(...)` — dynamic-shape tile streams when
-        outer dims aren't known at build time.
 
     Op-call conventions:
       - `write_back_mu=False` for compute and transform ops unless the
         immediate consumer is a `Bufferize` (then `True`).
       - `compute_bw=1024` is a sensible default for arithmetic ops.
       - `par_dispatch=1` on every `OffChipStore`.
+
+    Non-default tiling: if you need tile shapes other than `(1, inner_dim)`
+    (e.g. matrix tiles for matmul), bypass the supplied `Ei` and call
+    `step.LinearOffChipLoad(underlying=input_data['Ei'], ...)` yourself inside
+    the body. Both styles are accepted.
 function_inventory:
   desc: |
     Map functions — use with UnaryMap / BinaryMap. Tile-in, tile-out, same shape.
@@ -121,78 +84,19 @@ ops:
       - |
         input_data['E0']
     impl: |
-      # E0 is the raw fp32 torch tensor of shape (M_value, N_value). The
-      # default tiling `tile_row=1, tile_col=<innermost dim>` gives a stream
-      # of shape (1, M_value, 1) with tile dtype Tile(1, N_value) — small
-      # tiles that downstream Bufferize/Streamify can reshape on top.
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
+      # The harness's prepare() already builds a default LinearOffChipLoad
+      # per input. Re-load explicitly inside body() when you need non-default
+      # tiling (custom tile_row/tile_col, transposed=True, or a different
+      # stride/out_shape_tiled traversal). Here we just recreate the harness
+      # default for illustration.
+      E0_reload = step.LinearOffChipLoad(
+          underlying=input_data['E0'],
           stride=(1, 1),
           out_shape_tiled=(M_value, 1),
           tile_row=1, tile_col=N_value,
           par_dispatch=1,
       )
-      return step.OffChipStore(graph, E0, par_dispatch=1)
-- name: SelectGen
-  desc: |
-    Source op for one-hot / multi-hot routing tensors. Turns a fp32
-    underlying of shape ``(*outer_dims, n)`` into a stream of either
-    ``MultiHot(n)`` (when ``is_multihot=True``) or ``Index(n)`` elements,
-    with stream shape ``(1,) + outer_dims``. Use this when the input is a
-    select/route signal — e.g. ``expert_onehot`` in routed MoE — rather
-    than tile data; ``LinearOffChipLoad`` would tile-mis-shape the inner
-    ``n`` dim into the tile rather than treat it as the multihot fan-out.
-    The resulting Select-typed stream is consumable by ops whose control
-    signature accepts ``Tile | Select`` (e.g. ``FlatPartition``,
-    ``Parallelize``, ``StaticReassemble``).
-    Signature: step.SelectGen(is_multihot, tensor, n)
-  examples:
-  - inputs:
-    - name: E0
-      dtype: fp32
-      dims: [N, M]
-      data_gen: torch.randn
-    - name: Mhot
-      dtype: Multihot(fp32, E)
-      dims: [M]
-      min: 1
-      max: 1
-    global: |
-      E_value = 2
-      ctx[E] = E_value
-    outputs:
-    - name: S0
-      dtype: fp32
-      dims: [N, M]
-      data_transform:
-      - |
-        input_data['E0'][input_data['Mhot'][:, 0] > 0]
-    impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
-      # SelectGen turns a fp32 underlying of shape (*outer, E) into a
-      # Stream of MultiHot(E) elements with stream shape (1, *outer). Use
-      # this for one-hot / multi-hot routing tensors (e.g. expert_onehot
-      # in MoE) — LinearOffChipLoad would tile-mis-shape the inner E dim.
-      ctrl = step.SelectGen(is_multihot=True, tensor=Mhot, n=E_value)
-      # FlatPartition's `control` accepts either Tile or Select streams.
-      # Here ctrl is a MultiHot(E) stream that routes each input row to
-      # one of E consumer streams. We return consumer-0's slice.
-      parts = step.FlatPartition(
-          graph,
-          input=E0,
-          control=ctrl,
-          partition_rank=1,
-          switch_cycles=[1, 1],
-          write_back_mu=False,
-          num_consumers=E_value,
-      )
-      return step.OffChipStore(graph, (parts, 0), par_dispatch=1)
+      return step.OffChipStore(graph, E0_reload, par_dispatch=1)
 - name: OffChipStore
   desc: |
     Sink op: write a stream of tiles back to off-chip memory. The harness
@@ -216,13 +120,6 @@ ops:
       - |
         input_data['E0']
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       # Every body() ends in OffChipStore. Optionally pass
       # store_file_name=... to control where the simulator writes the
       # un-tiled output (the harness ignores the file name).
@@ -248,13 +145,6 @@ ops:
       - |
         input_data['E0'] ** 2
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       E1 = step.UnaryMap(graph, E0, fn=step.map_fn.Square(), write_back_mu=False, compute_bw=1024)
       return step.OffChipStore(graph, E1, par_dispatch=1)
 - name: BinaryMap
@@ -282,20 +172,6 @@ ops:
       - |
         input_data['E0'] + input_data['E1']
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
-      E1 = step.LinearOffChipLoad(
-          underlying=E1,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       E2 = step.BinaryMap(graph, E0, E1, fn=step.map_fn.Add(), write_back_mu=False, compute_bw=1024)
       return step.OffChipStore(graph, E2, par_dispatch=1)
 - name: Bufferize and Streamify
@@ -331,13 +207,6 @@ ops:
       - |
         input_data['E0']
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       buf = step.Bufferize(graph, E0, 1)
       out_stream = step.Streamify(graph, buf, stride=(1,), out_shape_tiled=(1,))
       return step.OffChipStore(graph, out_stream, par_dispatch=1)
@@ -363,13 +232,6 @@ ops:
       - |
         input_data['E0'].sum(dim=1)
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(K_value, 1, 1),
-          out_shape_tiled=(M_value, K_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       # E0 stream is (1, M, K, 1) with tile (1, N). accum_rank=2 folds the
       # trailing (K, 1) — the K reduction plus the trivial inner-1.
       E1 = step.Accum(
@@ -409,26 +271,12 @@ ops:
       - |
         torch.einsum('mkn,mkd->mnd', input_data['E0'], input_data['E1'])
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(K_value, 1, 1),
-          out_shape_tiled=(M_value, K_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
-      E1 = step.LinearOffChipLoad(
-          underlying=E1,
-          stride=(K_value, 1, 1),
-          out_shape_tiled=(M_value, K_value, 1),
-          tile_row=1, tile_col=D_value,
-          par_dispatch=1,
-      )
       # bmm via outer-product matmul: per (m, k), compute outer(E0[m,k,:],
       # E1[m,k,:]) of shape (N, D); sum over K.
       # E0 column-tile (N, 1) via transposed reload; E1 keeps the default
       # row-tile (1, D).
       E0_col = step.LinearOffChipLoad(
-          underlying=E0,
+          underlying=input_data['E0'],
           stride=(K_value, 1, 1),
           out_shape_tiled=(M_value, K_value, 1),
           tile_row=1, tile_col=N_value,
@@ -466,13 +314,6 @@ ops:
       - |
         input_data['E0']
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       E1 = step.Promote(graph, E0, promote_rank=1)
       return step.OffChipStore(graph, E1, par_dispatch=1)
 - name: PromoteOuter
@@ -498,13 +339,6 @@ ops:
       - |
         input_data['E0']
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       # PromoteOuter inserts a singleton stream dim at the outermost
       # position (equivalent to Promote(promote_rank=input.stream.rank)).
       # No data motion; useful to align two streams' ranks before BinaryMap.
@@ -531,13 +365,6 @@ ops:
       - |
         input_data['E0'].unsqueeze(0).expand(N_value, -1)
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0.reshape(1, M_value),
-          stride=(1, 1),
-          out_shape_tiled=(1, 1),
-          tile_row=1, tile_col=M_value,
-          par_dispatch=1,
-      )
       E1 = step.RepeatStatic(graph, E0, repeat_factor=N_value)
       return step.OffChipStore(graph, E1, par_dispatch=1)
 - name: RepeatRef
@@ -566,31 +393,17 @@ ops:
       - |
         input_data['E0'].unsqueeze(1).expand(K_value, N_value, M_value)
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(K_value, 1),
-          tile_row=1, tile_col=M_value,
-          par_dispatch=1,
-      )
-      E1 = step.LinearOffChipLoad(
-          underlying=E1,
-          stride=(N_value, 1, 1),
-          out_shape_tiled=(K_value, N_value, 1),
-          tile_row=1, tile_col=M_value,
-          par_dispatch=1,
-      )
       # Re-load both inputs without the default trailing-1 stream dim so
       # the RepeatRef constraint input.shape == ref.shape[:-1] holds.
       E0_flat = step.LinearOffChipLoad(
-          underlying=E0,
+          underlying=input_data['E0'],
           stride=(1,),
           out_shape_tiled=(K_value,),
           tile_row=1, tile_col=M_value,
           par_dispatch=1,
       )
       E1_flat = step.LinearOffChipLoad(
-          underlying=E1,
+          underlying=input_data['E1'],
           stride=(N_value, 1),
           out_shape_tiled=(K_value, N_value),
           tile_row=1, tile_col=M_value,
@@ -626,20 +439,6 @@ ops:
       - |
         input_data['E0'].unsqueeze(1).expand(M_value, K_value, N_value)
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
-      E1 = step.LinearOffChipLoad(
-          underlying=E1,
-          stride=(K_value, 1, 1),
-          out_shape_tiled=(M_value, K_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       # ExpandRef broadcasts an input's trailing singleton dims to match
       # a ref stream's trailing dims. Promote E0 first to add the
       # singleton, then expand across the (K, 1) trailing dims of E1.
@@ -667,13 +466,6 @@ ops:
       - |
         input_data['E0']
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(K_value, 1, 1),
-          out_shape_tiled=(M_value, K_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       E1 = step.Flatten(graph, E0, min_rank=1, max_rank=2)
       return step.OffChipStore(graph, E1, par_dispatch=1)
 - name: Reshape
@@ -697,13 +489,6 @@ ops:
       - |
         input_data['E0']
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(D_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       E1 = step.Reshape(graph, E0, chunk_size=8, reshape_rank=1, write_back_mu=False)
       return step.OffChipStore(graph, E1, par_dispatch=1)
 - name: ReshapePadStream
@@ -729,13 +514,6 @@ ops:
       - |
         torch.nn.functional.pad(input_data['E0'], (0, 0, 0, N_value - M_value), value=0.0)
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       # ReshapePadStream splits one stream dim into outer chunks of
       # chunk_size, zero-padding it up to the next multiple if needed.
       # Here M=5 with chunk_size=N=7 → padded to 7 (pad_count=2).
@@ -771,13 +549,6 @@ ops:
       - |
         input_data['E0']
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       # RetileStreamify splits a tile dim into multiple smaller sub-tiles
       # and prepends the chunk count as a new innermost stream dim.
       # split_row=False splits tile_col; chunk=1 yields N=7 single-element
@@ -806,13 +577,6 @@ ops:
       - |
         input_data['E0'] + input_data['E0']
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       # Explicit Broadcast: fan E0 out to two identical streams accessed
       # via (node, 0) / (node, 1). The compiler inserts Broadcast
       # automatically wherever a stream has multiple readers — this
@@ -849,13 +613,6 @@ ops:
       - |
         input_data['E0']
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(D_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       # Parallelize + StaticReassemble round-trip = identity. The compiler
       # inserts these to time-multiplex compute across hardware lanes;
       # user code rarely calls them directly. We Flatten the default-load
@@ -894,13 +651,6 @@ ops:
       - |
         input_data['E0']
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(D_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       # Inverse of Parallelize: round-robin-merge len(inputs) streams
       # back into one. Only round-trips with Parallelize when
       # merge_rank == input.stream.rank (whole outermost-dim slices are
@@ -943,13 +693,6 @@ ops:
       - |
         input_data['E0'][Mhot[:, 0] > 0]
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       # FlatPartition routes input tiles to one of num_consumers streams
       # based on a multihot control. Each output's outermost dim becomes
       # a DynDim sized by how many tiles route there. The constraint
@@ -998,20 +741,6 @@ ops:
       - |
         torch.cat([input_data['E0'], input_data['E1']], dim=0)
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
-      E1 = step.LinearOffChipLoad(
-          underlying=E1,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       # EagerMerge concatenates len(inputs) streams along the outermost
       # stream dim and emits a second "select" multihot stream marking
       # each output tile's source. We Flatten the default-load (1, M, 1)
@@ -1054,20 +783,6 @@ ops:
       - |
         torch.stack([input_data['E0'], input_data['E1']], dim=1).reshape(M_value, 2 * N_value)
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
-      E1 = step.LinearOffChipLoad(
-          underlying=E1,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       # FlatReassemble merges len(inputs) streams back into one according
       # to a control multihot. Inverse of FlatPartition; typical use is
       # combining per-expert outputs back into a single sequence after
@@ -1121,13 +836,6 @@ ops:
       - |
         input_data['E0']
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       # Drop tile-rows where the per-row Bool mask is 0. Output's inner
       # stream dim becomes a DynDim sized by how many rows survive.
       # NOTE: this requires `mask` to be a Tile(Bool) stream. The
@@ -1196,13 +904,6 @@ ops:
       - |
         input_data['E0']
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       # DynLinearOffChipLoad: source op for shapes only known at run
       # time. The underlying tensor is looked up at execute() time from
       # the `input_tensors` dict by `input_tensor_name` (the load isn't
@@ -1241,13 +942,6 @@ ops:
       - |
         input_data['E0']
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       # DynOffChipStore: sink variant of OffChipStore for streams whose
       # un-tiled shape is only known at run time. The output tensor
       # shape is read from `<shape_file_name>.json` at execute() time
@@ -1280,13 +974,6 @@ ops:
       - |
         input_data['E0']
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       # DynStreamify: dynamic-ref variant of Streamify. Replays a
       # Bufferize'd input across the stream shape of a `ref` stream
       # whose outer dim may be a DynDim. Constraints:
@@ -1373,13 +1060,6 @@ ops:
       - |
         input_data['E0']
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       # RandomOffChipStore: indirect-access scatter. Writes wdata tiles
       # into `underlying` at the per-tile addresses produced by waddr.
       # The Bool ack stream it returns is normally consumed downstream
@@ -1424,13 +1104,6 @@ ops:
       - |
         W.unsqueeze(0).expand(M_value, K_value, K_value)
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       # LinearOffChipLoadRef loads weight tiles and broadcasts them over
       # the ref stream's outer dims. Useful for sharing fixed weights
       # across a batch of activations without materializing the broadcast.
@@ -1494,12 +1167,51 @@ patterns:
       - |
         input_data['E0'].sum(dim=-1)
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1, 1),
-          out_shape_tiled=(M_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-      )
       E1 = step.UnaryMap(graph, E0, fn=step.map_fn.RowWiseSum(), write_back_mu=False, compute_bw=1024)
       return step.OffChipStore(graph, E1, par_dispatch=1)
+
+examples:
+- dims:
+    M: 32
+    K: 48
+  inputs:
+  - name: A
+    dtype: fp32
+    dims: [K, M]
+    data_gen: torch.randn
+  - name: B
+    dtype: fp32
+    dims: [K, M]
+    data_gen: torch.randn
+  outputs:
+  - name: S0
+    dtype: fp32
+    dims: [K, M]
+    data_transform:
+    - |
+      input_data['A'] + input_data['B']
+  impl: |-
+    E2 = step.BinaryMap(
+        graph, A, B,
+        fn=step.map_fn.Add(),
+        write_back_mu=False,
+        compute_bw=1024,
+    )
+    return step.OffChipStore(graph, E2, par_dispatch=1)
+- dims:
+    M: 32
+    K: 64
+  inputs:
+  - name: input
+    dtype: fp32
+    dims: [K, M]
+    data_gen: torch.randn
+  outputs:
+  - name: S0
+    dtype: fp32
+    dims: [K, M]
+    data_transform:
+    - |
+      norm = input_data['input'].pow(2).mean(dim=-1, keepdim=True)
+      input_data['input'] * torch.rsqrt(norm + 1e-6)
+  impl: "# Compute RMS normalization per row.\n# 1. Square the input.\nsq = step.UnaryMap(\n    graph,\n    input,\n    fn=step.map_fn.Square(),\n    write_back_mu=False,\n    compute_bw=1024,\n)\n# 2. Sum the squares across the innermost (M) dimension.\nsum_sq = step.UnaryMap(\n    graph,\n    sq,\n    fn=step.map_fn.RowWiseSum(),\n    write_back_mu=False,\n    compute_bw=1024,\n)\n# 3. Compute the mean by dividing by the number of elements (M).\n#    The dimension size M is known from the raw input tensor.\nM_dim = input_data[\"input\"].shape[-1]\nmean_sq = step.UnaryMap(\n    graph,\n    sum_sq,\n    fn=step.map_fn.MulImmediate(1.0 / float(M_dim)),\n    write_back_mu=False,\n    compute_bw=1024,\n)\n# 4. Add epsilon for numerical stability.\nnorm = step.UnaryMap(\n    graph,\n    mean_sq,\n    fn=step.map_fn.AddImmediate(1e-6),\n    write_back_mu=False,\n    compute_bw=1024,\n)\n# 5. Take the reciprocal square root.\ninv_sqrt = step.UnaryMap(\n    graph,\n    norm,\n    fn=step.map_fn.Rsqrt(),\n    write_back_mu=False,\n    compute_bw=1024,\n)\n# 6. Multiply the original input by the per\u2011row scaling factor.\n#    The scalar (1,1) tile from `inv_sqrt` is broadcast across the M columns.\nout = step.BinaryMap(\n    graph,\n    input,\n    inv_sqrt,\n    fn=step.map_fn.Mul(),\n    write_back_mu=False,\n    compute_bw=1024,\n)\nreturn step.OffChipStore(graph, out, par_dispatch=1)"

@@ -1,17 +1,54 @@
-import yaml
-import re
+"""YAML -> Python test codegen for the step_tl-backed PCL-lite flow.
+
+The codegen emits a test file with this layout:
+
+    import step, torch, sympy ...
+    input_data = {'E0': torch.randn(...), ...}
+
+    def test():
+        graph = step.Graph()
+        out = body(graph, input_data['E0'], input_data['E1'], ...)
+        out = step.execute(graph, out, input_tensors={})
+        ref0 = <data_transform[0]>
+        assert out.numel() == ref0.numel(), ...
+        torch.testing.assert_close(out.flatten(), ref0.flatten())
+
+    # `impl:` from the YAML is appended verbatim as `def body(graph, ...):`.
+
+Inputs are passed to the user-written ``body(graph, A, B, ...)`` as raw
+``torch.Tensor`` underlyings (named after the YAML's ``inputs[*].name``).
+The body is responsible for picking a source op for each input (e.g.
+``step.LinearOffChipLoad`` for fp32/fp16/uint64 tile streams,
+``step.SelectGen`` for Multihot/Index streams) and for returning either an
+``OffChipStore`` (single output) or a tuple of them (multi output).
+``step.execute`` is the functional emulator from step_tl.
+
+A short ``# Inputs:`` comment precedes the body signature so the LLM sees
+the underlying torch dtype + shape of each arg at the call site.
+"""
+
 import argparse
 import os
+import re
 from functools import reduce
 
-prefix = """
+import yaml
+
+
+HEADER = """
 import step
 from sympy import Symbol
 import torch
 from tools.get_indices import generate_multi_hot, generate_binary_tensor
 
 torch.manual_seed(42)
-E = Symbol("E")
+"""
+
+# Legacy fixed-symbol block used when a task YAML does not declare its own
+# ``dims:`` section. PCL-lite benchmarks under benchmark/ rely on these
+# concrete values (M=5, N=7, K=9, D=16); StepDB-derived YAMLs declare an
+# explicit ``dims:`` and swap this block out.
+LEGACY_DIMS_BLOCK = """E = Symbol("E")
 M = Symbol("M")
 N = Symbol("N")
 K = Symbol("K")
@@ -28,7 +65,42 @@ ctx = {
 }
 """
 
+
+def _render_dims_block(dims):
+    """Render ``Symbol(...) + <name>_value`` lines for a task-supplied dims map.
+
+    ``dims`` is ``{name: int}`` (preset values). Emits one
+    ``<name> = Symbol("<name>")`` and one ``<name>_value = <int>`` per entry,
+    plus a sympy ``ctx`` dict. Replaces the legacy M/N/K/D block whenever
+    the task YAML carries an explicit ``dims:`` section.
+    """
+    assert dims, "empty dims map"
+    sym_lines = "\n".join(f'{n} = Symbol("{n}")' for n in dims)
+    val_lines = "\n".join(f"{n}_value = {int(v)}" for n, v in dims.items())
+    ctx_entries = ", ".join(f"{n}: {n}_value" for n in dims)
+    return f"{sym_lines}\n{val_lines}\nctx = {{{ctx_entries}}}\n"
+
+
+def _prefix_for(data):
+    """Prefix block for a task: header + dims constants."""
+    dims = data.get("dims")
+    return HEADER + (_render_dims_block(dims) if dims else LEGACY_DIMS_BLOCK)
+
+
+# Back-compat alias: callers (helpers in this module + yaml_plan_to_code)
+# that previously concatenated the legacy prefix continue to work.
+prefix = HEADER + LEGACY_DIMS_BLOCK
+
+
+# ---------------------------------------------------------------------------
+# Helpers used by both yaml_to_code and yaml_plan_to_code
+# ---------------------------------------------------------------------------
+
+
 def replace_one_with_str(dims):
+    """Normalize a PCL-lite ``dims`` list: ints stay, ``1`` becomes the
+    string ``"1"`` so it can be templated alongside symbol names.
+    """
     if isinstance(dims, list):
         return list(map(lambda x: str(x) if x == 1 else x, dims))
     elif dims == 1:
@@ -37,142 +109,20 @@ def replace_one_with_str(dims):
         return dims
     else:
         raise ValueError(f"Unknown dims: {dims}")
-    
 
-def extract_explicit_dtype(dtype):
-    if isinstance(dtype, list):
-        subtypes = list(map(extract_explicit_dtype, dtype))
-        return f"step.STuple(({', '.join(subtypes)}))"
-    elif isinstance(dtype, str):
-        dtype = dtype.replace("fp32", "step.Scalar(\"float\")")
-        dtype = dtype.replace("Buffer", "step.Buffer")
-        dtype = dtype.replace("Multihot", "step.Multihot")
-        return dtype
-    else:
-        raise ValueError(f"Unknown dtype: {dtype}")
-
-def extract_fn(fn):
-    name = fn.get("name", "")
-    func_name = fn.get("func_name", "")
-    apply = fn.get("apply", "")
-    input_dtype = fn.get("input_dtype", "")
-    output_dtype = fn.get("output_dtype", "")
-    init_list = fn.get("init", [])
-    if apply:
-        if init_list:
-            return extract_fn_with_init(name, func_name, apply, input_dtype, output_dtype, init_list)
-        else:
-            return extract_fn_wo_init(name, func_name, apply, input_dtype, output_dtype)
-    else:
-        raise ValueError(f"Missing apply function for {name}")
 
 def insert_indent(line_list, indent):
-    # Add indent to each "\n" in line_list
+    """Re-indent a multi-line block so embedded newlines pick up *indent*."""
     return line_list.replace("\n", indent)
-
-def extract_fn_with_init(name, func_name, apply, input_dtype, output_dtype, init_list):
-    init_returns = []
-    if not isinstance(output_dtype, list):
-        output_dtype_list = [output_dtype]
-    else:
-        output_dtype_list = output_dtype
-    for (dtype, value) in zip(output_dtype_list, init_list):
-        if "Buffer" in dtype:
-            # Extract the [M, N, ...] from dtype_code
-            # Cannot handle shape 1 for now
-            match = re.search(r'\[(.*?)\]', dtype)
-            if match:
-                full_str = match.group(1)
-                buff_dims = full_str.split(", ")
-                base_str = "(" + ", ".join(map(lambda x: x+"_value", reversed(buff_dims))) + ")"
-                if value == 0:
-                    init_returns.append(f"torch.zeros{base_str}")
-                elif value == 1:
-                    init_returns.append(f"torch.ones{base_str}")
-                else:
-                    raise ValueError(f" Unsupported Buffer init value {value}.")
-            else:
-                raise ValueError("Input string does not contain content in square brackets.")
-        elif dtype == "fp32":
-            if value == 0:
-                init_returns.append("torch.tensor(0)")
-            elif value == 1:
-                init_returns.append("torch.tensor(1)")
-            elif value == -1:
-                init_returns.append("torch.tensor(-1)")
-            elif value == "-inf":
-                init_returns.append("torch.tensor(float('-inf'))")
-            else:
-                raise ValueError(f" Unsupported Scalar init value {value}.")
-        else:
-            raise ValueError(f" Unsupported dtype {dtype}.")
-    
-    class_str = f"""
-class {name}(step.Fn):
-    def __init__(self, input, output):
-        super().__init__("{name}", input, output)
-
-    def getInit(self):
-        return [{', '.join(init_returns)}]
-
-    def apply(self, state, input):
-        {insert_indent(apply, "\n        ")}
-    """
-    obj_str = f"""
-{func_name} = {name}({extract_explicit_dtype(input_dtype)}, {extract_explicit_dtype(output_dtype)})
-    """
-    return class_str + obj_str + "\n"
-
-def extract_fn_wo_init(name, func_name, apply, input_dtype, output_dtype):
-    class_str = f"""
-class {name}(step.Fn):
-    def __init__(self, input, output):
-        super().__init__("{name}", input, output)
-    
-    def apply(self, input):
-        {insert_indent(apply, "\n        ")}
-    """
-    obj_str = f"""
-{func_name} = {name}({extract_explicit_dtype(input_dtype)}, {extract_explicit_dtype(output_dtype)})
-    """
-    return class_str + obj_str + "\n"
-
-def dims_to_datadims(dims, dtype_code):
-    if "Buffer" in dtype_code:
-        # Extract the [M, N, ...] from dtype_code
-        match = re.search(r'\[(.*?)\]', dtype_code)
-        if match:
-            full_str = match.group(1)
-            buff_dims = full_str.split(", ")
-            data_dims = reversed(buff_dims + dims)
-        else:
-            raise ValueError("Input string does not contain content in square brackets.")
-    else:
-        data_dims = reversed(dims)
-    return data_dims
-
-def torch_data_init(data_gen, data_dims, input=None):
-    if data_gen == "torch.rand" or data_gen == "torch.randn":
-        return data_gen + "(" + ", ".join(map(lambda x: x+"_value", data_dims)) + ")"
-    elif data_gen == "torch.ones":
-        return data_gen + "((" + ", ".join(map(lambda x: x+"_value", data_dims)) + "), dtype=torch.float)"
-    elif data_gen == "binary":
-        return f"generate_binary_tensor(({', '.join(map(lambda x: x+'_value', data_dims))}))"
-    else:
-        dtype = input.get("dtype", {})
-        assert "Multihot" in dtype, "Only support Multihot data_gen for now."
-        # Extract the E from dtype
-        match = re.search(r'Multihot\((\w+),\s*(\w+)\)', dtype)
-        if match:
-            scalar_dtype = match.group(1)
-            assert scalar_dtype == "fp32", "Only support float for now."
-            num_classes_symbol = match.group(2)
-            return f"generate_multi_hot(({', '.join(map(lambda x: x+'_value', data_dims))}), {input["min"]}, {input["max"]}, {num_classes_symbol}_value)"
-        else:
-            raise ValueError("Input string cannot be decoded as Multihot.")
 
 
 def extract_func_lines(func):
+    """Split a multi-line ``data_transform`` body into (stmts, final expr).
+
+    The final non-empty line is treated as the expression that defines the
+    reference tensor; preceding lines are intermediate statements (assigns,
+    etc.) that run before the assignment.
+    """
     lines = func.split('\n')
     id = len(lines) - 1
     for i in range(len(lines) - 1, -1, -1):
@@ -184,390 +134,422 @@ def extract_func_lines(func):
     return intermediate_lines, result_line
 
 
+def _torch_shape_for_dims(dims):
+    """PCL-lite ``dims`` are innermost-first; torch shape is reversed."""
+    return list(reversed(dims))
+
+
+def torch_data_init(data_gen, dims, input=None):
+    """Generate an input/parameter init expression from the YAML spec.
+
+    ``dims`` is the PCL-lite list (innermost-first); we reverse it so the
+    torch tensor's outermost dim corresponds to the leading shape entry.
+    Symbols become ``<sym>_value`` (referencing the constants in *prefix*).
+    """
+    torch_dims = _torch_shape_for_dims(dims)
+    shape_args = ", ".join(_value_of(d) for d in torch_dims)
+    if data_gen in ("torch.rand", "torch.randn"):
+        return f"{data_gen}({shape_args})"
+    if data_gen == "torch.ones":
+        return f"{data_gen}(({shape_args}), dtype=torch.float)"
+    if data_gen == "binary":
+        return f"generate_binary_tensor(({shape_args}))"
+
+    dtype = (input or {}).get("dtype", {})
+    assert "Multihot" in str(dtype), (
+        f"Unsupported data_gen={data_gen!r} for dtype={dtype!r}; only "
+        f"torch.rand[n], torch.ones, binary, and Multihot are recognised."
+    )
+    match = re.search(r"Multihot\((\w+),\s*(\w+)\)", dtype)
+    assert match, f"Cannot decode Multihot dtype {dtype!r}"
+    scalar_dtype, num_classes_symbol = match.group(1), match.group(2)
+    assert scalar_dtype == "fp32", f"Only fp32 Multihot supported; got {scalar_dtype}"
+    return (
+        f"generate_multi_hot(({shape_args}),"
+        f" {input['min']}, {input['max']}, {num_classes_symbol}_value)"
+    )
+
+
+def _load_params(dims):
+    """Default LinearOffChipLoad params for a PCL-lite input.
+
+    ``dims`` is innermost-first (e.g. ``[N, K, M]`` -> torch shape
+    ``(M, K, N)``). The default tiling is ``tile_row=1, tile_col=<inner>``
+    which makes every benchmark's input a stream of small tiles that the
+    LLM's body can reshape on top of.
+
+    Returns (underlying_expr_suffix, stride_expr, out_shape_tiled_expr,
+    tile_row, tile_col). ``underlying_expr_suffix`` is "" by default; for
+    1-D inputs it's a ``.reshape(1, K_value)`` so LinearOffChipLoad sees a
+    2-D tensor (its underlying must have rank >= 2).
+    """
+    torch_dims = _torch_shape_for_dims(dims)  # outermost-first
+    assert len(torch_dims) >= 1, f"empty dims {dims!r}"
+
+    # 1-D inputs: LinearOffChipLoad requires a 2-D underlying. View as
+    # (1, K) so the inner dim is still tile_col-covered and the outer dim
+    # contributes a singleton to out_shape_tiled.
+    if len(torch_dims) == 1:
+        inner = torch_dims[0]
+        underlying_suffix = f".reshape(1, {_value_of(inner)})"
+        out_expr = "(1, 1)"
+        stride_expr = "(1, 1)"
+        return underlying_suffix, stride_expr, out_expr, "1", _value_of(inner)
+
+    inner = torch_dims[-1]
+
+    # out_shape_tiled mirrors the torch shape but the innermost dim collapses
+    # to 1 because tile_col covers the whole inner row.
+    out_shape_tiled = torch_dims[:-1] + ["1"]
+    # stride is row-major over out_shape_tiled (advancing one tile in dim i
+    # jumps prod(out_shape_tiled[i+1:]) tile slots in flat order). The
+    # innermost out_shape_tiled entry is always "1" because tile_col covers
+    # the whole inner row — drop those 1s from the product to keep the
+    # generated source readable.
+    stride = []
+    for i in range(len(out_shape_tiled)):
+        factors = [_value_of(d) for d in out_shape_tiled[i + 1:] if d != "1"]
+        stride.append("*".join(factors) if factors else "1")
+    out_factors = [_value_of(d) for d in out_shape_tiled]
+    trailing_comma = "," if len(out_shape_tiled) == 1 else ""
+    stride_expr = "(" + ", ".join(stride) + trailing_comma + ")"
+    out_expr = "(" + ", ".join(out_factors) + trailing_comma + ")"
+    tile_col_expr = _value_of(inner)
+    return "", stride_expr, out_expr, "1", tile_col_expr
+
+
+def _value_of(d):
+    """Symbol/int dim -> Python source referencing the _value constant."""
+    if d == "1" or d == 1:
+        return "1"
+    return f"{d}_value"
+
+
+# ---------------------------------------------------------------------------
+# Main codegen
+# ---------------------------------------------------------------------------
+
+
+def _input_table(inputs):
+    """Render a one-line-per-input comment block describing the raw torch
+    tensors that ``body()`` receives. Surfaces dtype + dim list so the LLM
+    knows which source op to apply (e.g. fp32/uint64 -> LinearOffChipLoad;
+    Multihot -> SelectGen)."""
+    if not inputs:
+        return ""
+    lines = ["# Inputs (raw torch tensors passed positionally to body()):"]
+    for inp in inputs:
+        name = inp.get("name", "")
+        dtype = inp.get("dtype", "?")
+        dims = inp.get("dims", [])
+        dims_str = "[" + ", ".join(str(d) for d in dims) + "]"
+        lines.append(f"#   {name}: dtype={dtype}, dims={dims_str}")
+    return "\n".join(lines) + "\n"
+
+
 def yaml_to_code(data):
-
     inputs = data.get("inputs", [])
-    data_dict = {}
-    dtype_dict= {}
-    input_stream_dict = {}
-    input_names = []
-    for input in inputs:
-        name = input.get("name", '')
-        dtype = input.get("dtype", {})
-        dtype_code = extract_explicit_dtype(dtype)
-        dtype_dict[name] = dtype_code
-        dims = replace_one_with_str(input.get("dims", []))
-        data_gen = input.get("data_gen", "")
-        data_dims = dims_to_datadims(dims, dtype_code)
-        data_dict[name] = torch_data_init(data_gen, data_dims, input)
-        input_stream_dict[name] = f"""
-    {name} = step.Stream(\"{name}\", {dtype_code}, {len(dims) - 1}, [{", ".join(dims)}])
-    {name}.ctx = ctx
-    {name}.data = [input_data['{name}']]
-    """
-        input_names.append(name)
-    
-    param_dict = {}
     parameters = data.get("parameters", [])
-    for param in parameters:
-        name = param.get("name", '')
-        dtype = param.get("dtype", {})
-        dtype_code = extract_explicit_dtype(dtype)
-        dims = replace_one_with_str(param.get("dims", []))
-        data_gen = param.get("data_gen", "")
-        data_dims = dims_to_datadims(dims, dtype_code)
-        param_dict[name] = torch_data_init(data_gen, data_dims)
-    
     outputs = data.get("outputs", [])
-    check_shape_str = ""
-    check_data_str = ""
-    output_names = []
-    for output in outputs:
-        name = output.get("name", '')
-        dtype = output.get("dtype", '')
-        dtype_code = extract_explicit_dtype(dtype)
-        dims = replace_one_with_str(output.get("dims", []))
-        check_shape_dtype = f"""
-    output_dtype_{name} = {dtype_code}
-    assert {name}.dtype == {dtype_code}, f"The output dtype should be {{output_dtype_{name}.dtype}} but got {{{name}.dtype}}"
-    assert {name}.shape == [{', '.join(dims)}], f"The output shape should be [{', '.join(dims)}] but got {{{name}.shape}}"
-    """
-        check_data = ""
-        for (i, func) in enumerate(output.get("data_transform", "")):
-            intermediate_lines, result_line = extract_func_lines(func)
-            check_data += f"""
-    {insert_indent('\n'.join(intermediate_lines), "\n    ")}
-    {name}_data_{i} = {result_line}
-    torch.testing.assert_close({name}.data[{i}], {name}_data_{i})
-    """
-        check_shape_str += check_shape_dtype
-        check_data_str += check_data
-        output_names.append(name)
 
-    listof_input_names = ", ".join(input_names)
-    listof_output_names = ", ".join(output_names)
-    check_shape_str = "def check_shape(" + listof_output_names + "):" + check_shape_str
-    check_data_str = "def check_data(" + listof_output_names + "):" + check_data_str
-
-    fn_str = ""
-    fns = data.get("fns", [])
-    for fn in fns:
-        fn_str += extract_fn(fn)
-
-    global_stmts = data.get("global", "")
-    if global_stmts:
-        global_stmts_str = f"""
-{insert_indent(global_stmts, "\n")}
-"""
-    else:
-        global_stmts_str = ""
-
-    dtype_dict_str = "input_dtype = {\n"
-    for key, value in dtype_dict.items():
-        dtype_dict_str += f"    \'{key}\': {value},\n"
-    dtype_dict_str += "}"
+    # ---- input_data dict (inputs + parameters share this dict) ----
+    data_dict = {}
+    input_names = []
+    for inp in inputs:
+        name = inp.get("name", "")
+        dims = replace_one_with_str(inp.get("dims", []))
+        data_dict[name] = torch_data_init(inp.get("data_gen", ""), dims, inp)
+        input_names.append(name)
+    for param in parameters:
+        name = param.get("name", "")
+        dims = replace_one_with_str(param.get("dims", []))
+        data_dict[name] = torch_data_init(param.get("data_gen", ""), dims, param)
 
     data_dict_str = "input_data = {\n"
     for key, value in data_dict.items():
-        data_dict_str += f"    \'{key}\': {value},\n"
-    for key, value in param_dict.items():
-        data_dict_str += f"    \'{key}\': {value},\n"
+        data_dict_str += f"    '{key}': {value},\n"
     data_dict_str += "}"
 
-    prepare_str = "def prepare():"
-    for name in input_names:
-        prepare_str += input_stream_dict[name]
-    prepare_str += "return " + listof_input_names
+    listof_input_names = ", ".join(input_names)
+    body_call_args = ", ".join(f"input_data['{n}']" for n in input_names)
 
-    test_str = f"""
-def test():
-    {listof_input_names} = prepare()
-    {listof_output_names} = body({listof_input_names})
-    check_shape({listof_output_names})
-    check_data({listof_output_names})
-    """
+    # ---- reference computation + compare (one block per output) ----
+    ref_lines = []
+    compare_lines = []
+    n_outputs = len(outputs)
+    for i, output in enumerate(outputs):
+        name = output.get("name", "")
+        data_transforms = output.get("data_transform", []) or []
+        assert len(data_transforms) == 1, (
+            f"Output {name!r} has {len(data_transforms)} data_transforms; "
+            f"the new codegen pairs each OffChipStore with exactly one ref. "
+            f"Split into multiple outputs in the YAML if needed."
+        )
+        intermediate, result_line = extract_func_lines(data_transforms[0])
+        intermediate_block = "\n    ".join([l for l in intermediate if l.strip()])
+        if intermediate_block:
+            ref_lines.append(f"    {intermediate_block}")
+        ref_lines.append(f"    {name}_ref = {result_line.strip()}")
 
+        out_var = "out" if n_outputs == 1 else f"out[{i}]"
+        compare_lines.append(
+            f"    assert {out_var}.numel() == {name}_ref.numel(), "
+            f"f'output {name} numel {{{out_var}.numel()}} != ref {{{name}_ref.numel()}}'"
+        )
+        compare_lines.append(
+            f"    torch.testing.assert_close({out_var}.flatten(), {name}_ref.flatten())"
+        )
+
+    ref_block = "\n".join(ref_lines) if ref_lines else "    # no outputs"
+    compare_block = "\n".join(compare_lines) if compare_lines else ""
+
+    # ---- test() entrypoint ----
+    test_str = (
+        "def test():\n"
+        "    graph = step.Graph()\n"
+        f"    out = body(graph, {body_call_args})\n"
+        "    out = step.execute(graph, out, input_tensors={})\n"
+        f"{ref_block}\n"
+    )
+    if compare_block:
+        test_str += compare_block + "\n"
+
+    # ---- global stmts (YAML-level top-of-file injections) ----
+    global_stmts = data.get("global", "")
+    global_stmts_str = (
+        f"\n{insert_indent(global_stmts, chr(10))}\n" if global_stmts else ""
+    )
+
+    # ---- body() — LLM-provided impl. body args are raw torch tensors; the
+    # impl picks the appropriate source op per input.
     impl = data.get("impl", "")
     if impl:
-        impl_str = f"""
-def body({listof_input_names}):
-    {insert_indent(impl, "\n    ")}
-"""
+        input_table = _input_table(inputs)
+        impl_str = (
+            f"{input_table}"
+            f"def body(graph, {listof_input_names}):\n"
+            f"    {insert_indent(impl, chr(10) + '    ')}\n"
+        )
     else:
         impl_str = ""
-    
-    # Return the code
-    return reduce(lambda x, y: x + "\n" + y, [prefix, 
-                                            global_stmts_str,
-                                            dtype_dict_str, 
-                                            data_dict_str, 
-                                            fn_str, 
-                                            prepare_str,
-                                            check_shape_str, 
-                                            check_data_str, 
-                                            test_str, 
-                                            impl_str])
+
+    return reduce(
+        lambda x, y: x + "\n" + y,
+        [
+            _prefix_for(data),
+            global_stmts_str,
+            data_dict_str,
+            test_str,
+            impl_str,
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Auxiliary modes (plan, decode, deyaml)
+# ---------------------------------------------------------------------------
+
+
+def yaml_plan_to_code(data):
+    """Plan-mode test: only sanity-checks the reference tensor's shape.
+
+    No STeP graph is built or executed; this is used by ``scripts/validate.sh``
+    to confirm the YAML's data_transform produces tensors of the declared
+    output shape before the proposer is allowed to run.
+    """
+    inputs = data.get("inputs", [])
+    parameters = data.get("parameters", [])
+
+    data_dict = {}
+    for inp in inputs:
+        name = inp.get("name", "")
+        dims = replace_one_with_str(inp.get("dims", []))
+        data_dict[name] = torch_data_init(inp.get("data_gen", ""), dims, inp)
+    for param in parameters:
+        name = param.get("name", "")
+        dims = replace_one_with_str(param.get("dims", []))
+        data_dict[name] = torch_data_init(param.get("data_gen", ""), dims, param)
+
+    data_dict_str = "input_data = {\n"
+    for key, value in data_dict.items():
+        data_dict_str += f"    '{key}': {value},\n"
+    data_dict_str += "}"
+
+    check_block = ""
+    for output in data.get("outputs", []):
+        name = output.get("name", "")
+        dims = replace_one_with_str(output.get("dims", []))
+        # PCL-lite dims are innermost-first; the ref tensor's torch shape
+        # is the reverse.
+        torch_dims = _torch_shape_for_dims(dims)
+        expected = ", ".join(_value_of(d) for d in torch_dims)
+        for i, func in enumerate(output.get("data_transform", []) or []):
+            intermediate, result_line = extract_func_lines(func)
+            intermediate_block = "\n    ".join(
+                [l for l in intermediate if l.strip()]
+            )
+            if intermediate_block:
+                check_block += f"    {intermediate_block}\n"
+            check_block += f"    {name}_data_{i} = {result_line.strip()}\n"
+            check_block += (
+                f"    assert {name}_data_{i}.shape == ({expected},), "
+                f"f'expected {name} shape ({expected},) but got "
+                f"{{{name}_data_{i}.shape}}'\n"
+            )
+
+    test_str = "def test():\n" + (check_block or "    pass\n")
+
+    return reduce(lambda x, y: x + "\n" + y, [_prefix_for(data), data_dict_str, test_str])
+
 
 def decompose_step_yaml_to_code(input_file, output_dir):
-    """
-    Extract examples from a YAML file and save them as separate files.
-    
-    Args:
-        input_file (str): Path to input YAML file
-        output_dir (str): Directory to save extracted examples
-    """
-    with open(input_file, 'r') as f:
+    """Expand each example/helper in a doc YAML into its own .py file."""
+    with open(input_file, "r") as f:
         data = yaml.safe_load(f)
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    ops = data.get('ops', [])
-    patterns = data.get('patterns', [])
-    ops = ops + patterns
-    for op in ops:
-        op_name = op.get('name', 'unknown_op')
-        examples = op.get('examples', [])
-        for idx, example in enumerate(examples):
-            # Prepare the output filename
-            op_name = op_name.replace(' ', '_')
-            output_filename = f"{op_name}_example_{idx+1}.py"
-            output_path = os.path.join(output_dir, output_filename)
-
-            # Write the example to the file
-            with open(output_path, 'w') as f:
+    ops = data.get("ops", [])
+    patterns = data.get("patterns", [])
+    for op in ops + patterns:
+        op_name = op.get("name", "unknown_op").replace(" ", "_")
+        for idx, example in enumerate(op.get("examples", [])):
+            output_path = os.path.join(
+                output_dir, f"{op_name}_example_{idx+1}.py"
+            )
+            with open(output_path, "w") as f:
                 f.write(yaml_to_code(example))
             print(f"Extracted example {idx+1} for op '{op_name}' to {output_path}")
-    helpers = data.get('helpers', [])
-    for (idx, helper) in enumerate(helpers):
-        output_filename = f"helper_{idx+1}.py"
-        output_path = os.path.join(output_dir, output_filename)
-        with open(output_path, 'w') as f:
+
+    for idx, helper in enumerate(data.get("helpers", [])):
+        output_path = os.path.join(output_dir, f"helper_{idx+1}.py")
+        with open(output_path, "w") as f:
             f.write(yaml_to_code(helper))
         print(f"Extracted helper {idx+1} to {output_path}")
 
+
+# ---------------------------------------------------------------------------
+# YAML pretty-printing helpers (kept exactly as before — used by reinforce/)
+# ---------------------------------------------------------------------------
+
+
 def literal_presenter(dumper, data):
-    """Present multiline strings as literal blocks."""
-    return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+
 
 def flow_list_presenter(dumper, data):
-    """Present lists in flow style [x, y, z]."""
-    return dumper.represent_sequence('tag:yaml.org,2002:seq', data, flow_style=True)
+    return dumper.represent_sequence(
+        "tag:yaml.org,2002:seq", data, flow_style=True
+    )
 
-class literal(str): pass
-class flow_list(list): pass
+
+class literal(str):
+    pass
+
+
+class flow_list(list):
+    pass
+
 
 yaml.add_representer(literal, literal_presenter)
 yaml.add_representer(flow_list, flow_list_presenter)
 
+
 def should_be_flow_list(data):
-    """Check if a list should use flow style."""
     if not isinstance(data, list):
         return False
-    # Check if it's a simple list (numbers or single-line strings)
     return all(
-        isinstance(x, (int, float)) or 
-        (isinstance(x, str) and '\n' not in x and not isinstance(x, literal))
+        isinstance(x, (int, float))
+        or (isinstance(x, str) and "\n" not in x and not isinstance(x, literal))
         for x in data
     )
 
+
 def convert_to_literal(data):
-    """Convert string values to literal blocks if they contain newlines."""
     if isinstance(data, dict):
         return {key: convert_to_literal(value) for key, value in data.items()}
     elif isinstance(data, list):
-        # Convert each item in the list
         converted_list = [convert_to_literal(item) for item in data]
-        # Check if any item in the converted list is a literal
         has_literal = any(isinstance(x, literal) for x in converted_list)
-        # If the list should be flow style and doesn't contain literals, make it a flow_list
         if should_be_flow_list(data) and not has_literal:
             return flow_list(converted_list)
         return converted_list
     elif isinstance(data, str):
-        # Convert to literal if contains newlines or is indented
-        if '\n' in data or 'input_data' in data:
+        if "\n" in data or "input_data" in data:
             return literal(data)
     return data
 
 
 def decompose_step_yaml(input_file, output_dir):
-
-    with open(input_file, 'r') as f:
+    with open(input_file, "r") as f:
         data = yaml.safe_load(f)
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    ops = data.get('ops', [])
-    for op in ops:
-        op_name = op.get('name', 'unknown_op')
-        examples = op.get('examples', [])
-        for idx, example in enumerate(examples):
-            # Prepare the output filename
-            op_name = op_name.replace(' ', '_')
-            output_filename = f"{op_name}_example_{idx+1}.yaml"
-            output_path = os.path.join(output_dir, output_filename)
-            example_dict = {'examples': [convert_to_literal(example)]}
-
-            # Write the example to the file
-            with open(output_path, 'w') as f:
-                yaml.dump(example_dict, f, default_flow_style=False, sort_keys=False, width=float("inf"))
+    for op in data.get("ops", []):
+        op_name = op.get("name", "unknown_op").replace(" ", "_")
+        for idx, example in enumerate(op.get("examples", [])):
+            output_path = os.path.join(
+                output_dir, f"{op_name}_example_{idx+1}.yaml"
+            )
+            example_dict = {"examples": [convert_to_literal(example)]}
+            with open(output_path, "w") as f:
+                yaml.dump(
+                    example_dict, f, default_flow_style=False, sort_keys=False,
+                    width=float("inf"),
+                )
             print(f"Extracted example {idx+1} for op '{op_name}' to {output_path}")
 
-    helpers = data.get('helpers', [])
-    for (idx, helper) in enumerate(helpers):
-        output_filename = f"helper_{idx+1}.yaml"
-        output_path = os.path.join(output_dir, output_filename)
-        helper_dict = {'helpers': [convert_to_literal(helper)]}
-        with open(output_path, 'w') as f:
-            yaml.dump(helper_dict, f, default_flow_style=False, sort_keys=False, width=float("inf"))
+    for idx, helper in enumerate(data.get("helpers", [])):
+        output_path = os.path.join(output_dir, f"helper_{idx+1}.yaml")
+        helper_dict = {"helpers": [convert_to_literal(helper)]}
+        with open(output_path, "w") as f:
+            yaml.dump(
+                helper_dict, f, default_flow_style=False, sort_keys=False,
+                width=float("inf"),
+            )
         print(f"Extracted helper {idx+1} to {output_path}")
 
-def yaml_plan_to_code(data):
 
-    inputs = data.get("inputs", [])
-    data_dict = {}
-    dtype_dict= {}
-    input_stream_dict = {}
-    input_names = []
-    for input in inputs:
-        name = input.get("name", '')
-        dtype = input.get("dtype", {})
-        dtype_code = extract_explicit_dtype(dtype)
-        dtype_dict[name] = dtype_code
-        dims = replace_one_with_str(input.get("dims", []))
-        data_gen = input.get("data_gen", "")
-        data_dims = dims_to_datadims(dims, dtype_code)
-        data_dict[name] = torch_data_init(data_gen, data_dims, input)
-        input_stream_dict[name] = f"""
-    {name} = step.Stream(\"{name}\", {dtype_code}, {len(dims) - 1}, [{", ".join(dims)}])
-    {name}.ctx = ctx
-    {name}.data = [input_data['{name}']]
-    """
-        input_names.append(name)
+# ---------------------------------------------------------------------------
+# Misc utilities used by reinforce/
+# ---------------------------------------------------------------------------
 
-    param_dict = {}
-    parameters = data.get("parameters", [])
-    for param in parameters:
-        name = param.get("name", '')
-        dtype = param.get("dtype", {})
-        dtype_code = extract_explicit_dtype(dtype)
-        dims = replace_one_with_str(param.get("dims", []))
-        data_gen = param.get("data_gen", "")
-        data_dims = dims_to_datadims(dims, dtype_code)
-        param_dict[name] = torch_data_init(data_gen, data_dims)
-
-    outputs = data.get("outputs", [])
-    check_data_shape_str = ""
-    output_names = []
-    for output in outputs:
-        name = output.get("name", '')
-        dtype = output.get("dtype", '')
-        dtype_code = extract_explicit_dtype(dtype)
-        dims = replace_one_with_str(output.get("dims", []))
-        data_dims = []
-        if isinstance(dtype, list):
-            for single_dtype in dtype:
-                data_dims.append(dims_to_datadims(dims, single_dtype))
-        else:
-            data_dims.append(dims_to_datadims(dims, dtype))
-        check_data_shape = ""
-        for (i, func) in enumerate(output.get("data_transform", "")):
-            intermediate_lines, result_line = extract_func_lines(func)
-            check_data_shape += f"""
-    {insert_indent('\n'.join(intermediate_lines), "\n    ")}
-    {name}_data_{i} = {result_line} 
-    assert {name}_data_{i}.shape == ({', '.join(map(lambda x: x+"_value" if x != "1" else "1", data_dims[i]))})
-    """
-        check_data_shape_str += check_data_shape
-        output_names.append(name)
-
-    check_data_shape_str = "def test(): \n" + check_data_shape_str
-
-    fn_str = ""
-    fns = data.get("fns", [])
-    for fn in fns:
-        fn_str += extract_fn(fn)
-
-    dtype_dict_str = "input_dtype = {\n"
-    for key, value in dtype_dict.items():
-        dtype_dict_str += f"    \'{key}\': {value},\n"
-    dtype_dict_str += "}"
-
-    data_dict_str = "input_data = {\n"
-    for key, value in data_dict.items():
-        data_dict_str += f"    \'{key}\': {value},\n"
-    data_dict_str += "}"
-
-    # Return the code
-    return reduce(lambda x, y: x + "\n" + y, [prefix, 
-                                            dtype_dict_str, 
-                                            data_dict_str, 
-                                            fn_str,
-                                            check_data_shape_str])
 
 def clean_python_code(code_string):
-    """
-    Remove comments and extra newlines from Python code while preserving code functionality.
-    
-    Args:
-        code_string (str): Input Python code as a string
-        
-    Returns:
-        str: Cleaned Python code with comments and extra newlines removed
-    """
-    # Split the code into lines
-    lines = code_string.split('\n')
-    
-    # Process each line
+    """Strip comments and blank lines from Python source while preserving strings."""
+    lines = code_string.split("\n")
     cleaned_lines = []
     for line in lines:
-        # Remove leading and trailing whitespace
         stripped = line.strip()
-        
-        # Skip empty lines
         if not stripped:
             continue
-            
-        # Skip comment-only lines
-        if stripped.startswith('#'):
+        if stripped.startswith("#"):
             continue
-            
-        # Remove inline comments while preserving string literals
-        result = ''
+        result = ""
         in_string = False
         string_char = None
         i = 0
-        
         while i < len(line):
             char = line[i]
-            
-            # Handle string literals
-            if char in ['"', "'"] and (i == 0 or line[i-1] != '\\'):
+            if char in ['"', "'"] and (i == 0 or line[i - 1] != "\\"):
                 if not in_string:
                     in_string = True
                     string_char = char
                 elif char == string_char:
                     in_string = False
                 result += char
-                
-            # Handle comments
-            elif char == '#' and not in_string:
+            elif char == "#" and not in_string:
                 break
-                
-            # Handle all other characters
             else:
                 result += char
-            
             i += 1
-            
-        # Add non-empty lines to result
         if result.strip():
             cleaned_lines.append(result.rstrip())
-    
-    # Join lines with single newlines
-    return '\n'.join(cleaned_lines)
+    return "\n".join(cleaned_lines)
+
 
 def batch_yaml_to_code(task_data, temp_dir, model_name, rounds, prefix):
     for id in range(rounds):
@@ -576,21 +558,23 @@ def batch_yaml_to_code(task_data, temp_dir, model_name, rounds, prefix):
         if not os.path.exists(impl_path):
             continue
         with open(impl_path, "r") as f:
-            impl_str = f.read()
-            impl_data = yaml.safe_load(impl_str)
+            impl_data = yaml.safe_load(f.read())
         data = {**task_data, **impl_data}
         code = yaml_to_code(data)
-        with open(temp_test_path, 'w') as file:
+        with open(temp_test_path, "w") as file:
             file.write(code)
 
+
 def remove_all_py(temp_dir):
-    for root, dirs, files in os.walk(temp_dir):
+    for root, _, files in os.walk(temp_dir):
         for file in files:
             if file.endswith(".py"):
                 os.remove(os.path.join(root, file))
 
+
 def clean_model_name(model_name):
     return model_name.replace(":", "")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -601,8 +585,7 @@ if __name__ == "__main__":
 
     if args.mode == "single":
         with open(args.yaml, "r") as file:
-            yaml_content = file.read()
-        data = yaml.safe_load(yaml_content)
+            data = yaml.safe_load(file.read())
         with open(args.output, "w") as file:
             file.write(yaml_to_code(data))
     elif args.mode == "decode":
@@ -611,8 +594,7 @@ if __name__ == "__main__":
         decompose_step_yaml(args.yaml, args.output)
     elif args.mode == "plan":
         with open(args.yaml, "r") as file:
-            yaml_content = file.read()
-        data = yaml.safe_load(yaml_content)
+            data = yaml.safe_load(file.read())
         with open(args.output, "w") as file:
             file.write(yaml_plan_to_code(data))
     else:

@@ -1,0 +1,184 @@
+# Source-of-truth skeleton for the proposer prompts. tools/build_prompts.py
+# reads this, the per-op docstrings from step_tl, and prompts/_op_examples.yaml
+# to emit proposer_base.yaml (structured) and proposer_base_ws.yaml (workspace).
+#
+# Edit this file, examples, or the step_tl docstrings — never the generated
+# proposer_base*.yaml files directly. Re-run build_prompts.py to refresh.
+
+general:
+  desc: |
+    Streaming Tensor Programs (STeP) is a graph-based dataflow IR backed by the
+    `step_tl` library, surfaced here as `step.*`. You are writing a single
+    function `body(graph, E0, E1, ...)` that builds the compute graph:
+
+      • `graph` is the `step.Graph()` that the harness creates and threads
+        through every node.
+      • Each `Ei` arg is a **raw `torch.Tensor`** — the underlying for the
+        YAML input named `Ei`. The body is responsible for picking a source
+        op per input and applying it before any compute ops can consume it.
+        The codegen emits a `# Inputs:` comment block immediately above your
+        `def body(...)` listing each arg's dtype and PCL-lite dims so you can
+        choose the right loader.
+      • Compose `step.*` ops; each compute/transform op takes `graph` as its
+        first argument and returns a new node consumed by reference.
+      • The body MUST end with `return step.OffChipStore(graph, <last_node>,
+        par_dispatch=1)`. For multiple outputs return a tuple of stores.
+
+    HARD CONSTRAINT — no torch-to-step bypass. Every reference to an input
+    tensor (whether the bare `Ei` arg or `input_data['Ei']`) must appear
+    inside the `underlying=` / `tensor=` kwarg expression of a source-op
+    call (`LinearOffChipLoad`, `SelectGen`, `RandomOffChipLoad`,
+    `DynLinearOffChipLoad`). Tensor-view methods on the input
+    (`.reshape`, `.view`, `.permute`, `.unsqueeze`, …) inside that kwarg
+    are fine. Passing a raw input tensor to `torch.*` math, the `@`
+    matmul operator, indexing, or any helper function is rejected by a
+    static gate before pytest — there is no point computing the answer
+    in plain torch and wrapping it in a load. After
+    `Ei = step.SourceOp(underlying=Ei, ...)` the name `Ei` is a stream
+    and may flow into any `step.*` op unrestricted.
+
+    The harness then runs `step.execute(graph, store, input_tensors={})` and
+    flat-compares the result (always a 2-D un-tiled tensor) against the
+    reference computed from `data_transform`. Only `numel` and element-wise
+    values are checked; shapes are not enforced.
+
+    Module-level symbols available in scope:
+      - `step` (the step_tl shim)
+      - `torch`
+      - `input_data` (dict of raw torch tensors, keyed by input name —
+        identical to the positional body args, exposed for use inside
+        compute-side helpers like map_fn closures)
+      - Per-symbol value constants: `M_value, N_value, K_value, D_value` (= 5,
+        7, 9, 16) and the sympy Symbols `M, N, K, D` for shape derivation.
+
+    Source-op catalog (pick one per input, driven by the input's declared
+    dtype in the `# Inputs:` table):
+
+      - `step.LinearOffChipLoad(underlying=Ei, stride, out_shape_tiled,
+        tile_row, tile_col, par_dispatch=1)`
+        Tile and stream a fixed-stride tensor. Use for fp32/fp16/uint64
+        underlyings. Default tiling `tile_row=1, tile_col=<innermost dim>`
+        gives stream shape `(1, *outer_dims, 1)` with tile dtype
+        `Tile(1, inner_dim)`. Underlying must be rank>=2; reshape 1-D
+        tensors with `Ei.reshape(1, N_value)` first.
+
+      - `step.SelectGen(is_multihot=True, tensor=Ei, n=<E>_value)`
+        Load a fp32 underlying of shape `(*outer_dims, E)` as a stream of
+        `MultiHot(E)` rows. Use for one-hot routing tensors like
+        `expert_onehot` (declared dtype `Multihot(fp32, E)`). Output stream
+        shape is `(1,) + tensor.shape[:-1]`. Use `is_multihot=False` for
+        `Index(n)` streams instead.
+
+      - `step.RandomOffChipLoad(graph, underlying=Ei, raddr=<addr-stream>,
+        tile_row, tile_col, base_addr_byte, par_dispatch=1)`
+        Gather-style indirect load driven by an address stream. fp32/fp16
+        only (no uint64).
+
+      - `step.DynLinearOffChipLoad(...)` — dynamic-shape tile streams when
+        outer dims aren't known at build time.
+
+    Op-call conventions:
+      - `write_back_mu=False` for compute and transform ops unless the
+        immediate consumer is a `Bufferize` (then `True`).
+      - `compute_bw=1024` is a sensible default for arithmetic ops.
+      - `par_dispatch=1` on every `OffChipStore`.
+
+function_inventory:
+  desc: |
+    Map functions — use with UnaryMap / BinaryMap. Tile-in, tile-out, same shape.
+      Unary:  Square, Silu, Exp, Pow2, Rsqrt, Sqrt, RowWiseSum,
+              MulImmediate(c), AddImmediate(c), SubImmediate(c)
+      Binary: Add, Sub, Mul, Div, IsEqual,
+              Matmul(weight_transposed=False)       # tile-wise (M,K)x(K,N)
+
+    Accumulation functions — use with Accum to fold trailing stream dims.
+      Add, Mul, Max, RetileRow, RetileCol, SignalReqAllRead
+
+    Map+Accum functions — use with BinaryMapAccum for fused matmul-reduce.
+      Matmul(weight_transposed=False)
+
+    Init functions — supply the initial state for Accum / BinaryMapAccum.
+      Zero(shape, dtype), Empty(shape, dtype), DynEmpty(shape, dtype)
+
+# Order in which ops appear in the prompt. Two forms are accepted:
+#   - <string>           : single op; pulls docstring + signature from
+#                          step_tl by class name. Example key in
+#                          _op_examples.yaml = the class name.
+#   - {name, classes,    : combined entry. `classes` is a list of step_tl
+#      extra_desc?}        op classes whose docstrings get concatenated under
+#                          the heading `name`. `extra_desc` (optional) is
+#                          appended after the concatenated docstrings.
+#                          Example key in _op_examples.yaml = `name` (with
+#                          spaces preserved).
+op_order:
+  # --- Source / sink ops (every body() loads inputs via these and ends with one) ---
+  - LinearOffChipLoad
+  - SelectGen
+  - OffChipStore
+
+  # --- Core elementwise compute ---
+  - UnaryMap
+  - BinaryMap
+
+  # --- Reshape / re-view (paired or standalone) ---
+  - name: "Bufferize and Streamify"
+    classes: [Bufferize, Streamify]
+    extra_desc: |
+      Used together they reshape, transpose, or move dimensions of a stream —
+      no data motion, just a re-view. The simplest round-trip is
+      `Bufferize(rank=1) → Streamify(stride=(1,), out_shape_tiled=(1,))`, an
+      identity reshape.
+
+  # --- Reduction / fused matmul ---
+  - Accum
+  - BinaryMapAccum
+
+  # --- Singleton / broadcast / repeat ---
+  - Promote
+  - PromoteOuter
+  - RepeatStatic
+  - RepeatRef
+  - ExpandRef
+
+  # --- Stream-shape transforms ---
+  - Flatten
+  - Reshape
+  - ReshapePadStream
+  - RetileStreamify
+
+  # --- Parallelism (compiler-inserted but documented for completeness) ---
+  - Broadcast
+  - Parallelize
+  - StaticReassemble
+
+  # --- Routing (MoE / dynamic-shape) ---
+  - FlatPartition
+  - EagerMerge
+  - FlatReassemble
+  - FlatmapFilterRowStreamify
+  - FlatmapCounter
+
+  # --- Dynamic-shape source/sink ---
+  - DynLinearOffChipLoad
+  - DynOffChipStore
+  - DynStreamify
+
+  # --- Indirect-access source/sink ---
+  - RandomOffChipLoad
+  - RandomOffChipStore
+  - LinearOffChipLoadRef
+
+  # --- Test/debug ---
+  - MockStreamOp
+
+# Standalone "patterns" — idiomatic compositions that don't map 1:1 to a
+# single class. Each entry just bundles a hand-written desc + an example
+# key from _op_examples.yaml.
+patterns:
+  - name: Inner-dim row-wise reduction
+    example_key: "Inner-dim row-wise reduction"
+    desc: |
+      When the dim you want to reduce is already the innermost dim, it lives
+      inside the tile (since default `tile_col=<inner>`). Use UnaryMap with
+      map_fn.RowWiseSum() to sum across the tile's last dim — no Accum
+      required, no shape gymnastics. Output tiles become (1, 1).

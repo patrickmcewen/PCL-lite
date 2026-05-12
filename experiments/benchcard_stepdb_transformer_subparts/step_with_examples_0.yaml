@@ -1503,3 +1503,139 @@ patterns:
       )
       E1 = step.UnaryMap(graph, E0, fn=step.map_fn.RowWiseSum(), write_back_mu=False, compute_bw=1024)
       return step.OffChipStore(graph, E1, par_dispatch=1)
+
+examples:
+- dims:
+    M: 32
+    K: 48
+  inputs:
+  - name: A
+    dtype: fp32
+    dims: [K, M]
+    data_gen: torch.randn
+  - name: B
+    dtype: fp32
+    dims: [K, M]
+    data_gen: torch.randn
+  outputs:
+  - name: S0
+    dtype: fp32
+    dims: [K, M]
+    data_transform:
+    - |
+      input_data['A'] + input_data['B']
+  impl: |-
+    A = step.LinearOffChipLoad(
+        underlying=A,
+        stride=(1, 1),
+        out_shape_tiled=(M_value, 1),
+        tile_row=1, tile_col=K_value,
+        par_dispatch=1,
+    )
+    B = step.LinearOffChipLoad(
+        underlying=B,
+        stride=(1, 1),
+        out_shape_tiled=(M_value, 1),
+        tile_row=1, tile_col=K_value,
+        par_dispatch=1,
+    )
+    S0 = step.BinaryMap(
+        graph,
+        A,
+        B,
+        fn=step.map_fn.Add(),
+        write_back_mu=False,
+        compute_bw=1024,
+    )
+    return step.OffChipStore(graph, S0, par_dispatch=1)
+- dims:
+    M: 128
+    K: 64
+  inputs:
+  - name: input
+    dtype: fp32
+    dims: [K, M]
+    data_gen: torch.randn
+  outputs:
+  - name: S0
+    dtype: fp32
+    dims: [K, M]
+    data_transform:
+    - |
+      norm = input_data['input'].pow(2).mean(dim=-1, keepdim=True)
+      input_data['input'] * torch.rsqrt(norm + 1e-5)
+  impl: |-
+    input_stream = step.LinearOffChipLoad(
+        underlying=input,
+        stride=(1, 1),
+        out_shape_tiled=(M_value, 1),
+        tile_row=1, tile_col=K_value,
+        par_dispatch=1,
+    )
+    sq = step.UnaryMap(
+        graph, input_stream,
+        fn=step.map_fn.Square(),
+        write_back_mu=False,
+        compute_bw=1024,
+    )
+    sum_sq = step.UnaryMap(
+        graph, sq,
+        fn=step.map_fn.RowWiseSum(),
+        write_back_mu=False,
+        compute_bw=1024,
+    )
+    mean_sq = step.UnaryMap(
+        graph, sum_sq,
+        fn=step.map_fn.MulImmediate(1.0 / K_value),
+        write_back_mu=False,
+        compute_bw=1024,
+    )
+    norm = step.UnaryMap(
+        graph, mean_sq,
+        fn=step.map_fn.AddImmediate(1e-5),
+        write_back_mu=False,
+        compute_bw=1024,
+    )
+    inv_sqrt = step.UnaryMap(
+        graph, norm,
+        fn=step.map_fn.Rsqrt(),
+        write_back_mu=False,
+        compute_bw=1024,
+    )
+    out = step.BinaryMap(
+        graph, input_stream, inv_sqrt,
+        fn=step.map_fn.Mul(),
+        write_back_mu=False,
+        compute_bw=1024,
+    )
+    return step.OffChipStore(graph, out, par_dispatch=1)
+- dims:
+    M: 32
+    N: 512
+    D: 64
+  inputs:
+  - name: Q
+    dtype: fp32
+    dims: [D, M]
+    data_gen: torch.randn
+  - name: K
+    dtype: fp32
+    dims: [D, N]
+    data_gen: torch.randn
+  - name: V
+    dtype: fp32
+    dims: [D, N]
+    data_gen: torch.randn
+  outputs:
+  - name: S0
+    dtype: fp32
+    dims: [D, M]
+    data_transform:
+    - |
+      scores = input_data['Q'] @ input_data['K'].T
+      row_max = scores.max(dim=-1, keepdim=True).values
+      exp_scores = torch.exp(scores - row_max)
+      context = exp_scores @ input_data['V']
+      norm_attn = exp_scores.sum(dim=-1, keepdim=True)
+      context / norm_attn
+  impl: "# Load Q as a single tile of shape (M, D)\nQ_tile = step.LinearOffChipLoad(\n    underlying=Q,\n    stride=(1, 1),\n    out_shape_tiled=(1, 1),\n    tile_row=M_value,\n    tile_col=D_value,\n    par_dispatch=1,\n)\n# Load K and transpose it to get a tile of shape (D, N)\nK_tile = step.LinearOffChipLoad(\n    underlying=K,\n    stride=(1, 1),\n    out_shape_tiled=(1, 1),\n    tile_row=N_value,\n    tile_col=D_value,\n    transposed=True,\n    par_dispatch=1,\n)\n# Load V as a single tile of shape (N, D)\nV_tile = step.LinearOffChipLoad(\n    underlying=V,\n    stride=(1, 1),\n    out_shape_tiled=(1, 1),\n    tile_row=N_value,\n    tile_col=D_value,\n    par_dispatch=1,\n)\n# scores = Q @ K^T  (produces an (M, N) tile)\nscores = step.BinaryMap(\n    graph,\n    Q_tile,\n    K_tile,\n    fn=step.map_fn.Matmul(),\n    write_back_mu=False,\n    compute_bw=1024,\n)\n# exp_scores = exp(scores)\nexp_scores = step.UnaryMap(\n    graph,\n    scores,\n    fn=step.map_fn.Exp(),\n    write_back_mu=False,\n    compute_bw=1024,\n)\n# norm = row\u2011wise sum of exp_scores (shape M\xD71)\nnorm = step.UnaryMap(\n    graph,\n    exp_scores,\n    fn=step.map_fn.RowWiseSum(),\n    write_back_mu=False,\n    compute_bw=1024,\n)\n# context = exp_scores @ V  (produces an (M, D) tile)\ncontext = step.BinaryMap(\n    graph,\n    exp_scores,\n    V_tile,\n    fn=step.map_fn.Matmul(),\n    write_back_mu=False,\n    compute_bw=1024,\n)\n# output = context / norm  (broadcast norm across the D dimension)\noutput = step.BinaryMap(\n    graph,\n    context,\n    norm,\n    fn=step.map_fn.Div(),\n    write_back_mu=False,\n    compute_bw=1024,\n)\nreturn step.OffChipStore(graph, output, par_dispatch=1)"

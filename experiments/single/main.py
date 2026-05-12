@@ -5,7 +5,7 @@ import os
 import json
 import csv
 
-def parallel_affine_impl(model_name, base_path, example_path, task_path, exp_name, num_samples, temperature=0.7):
+def parallel_affine_impl(model_name, base_path, example_path, task_path, exp_name, num_samples, temperature=0.7, max_tokens=1024):
     temp_base_dir = os.path.join(base_path, exp_name)
     if not os.path.exists(temp_base_dir):
         os.makedirs(temp_base_dir)
@@ -15,7 +15,7 @@ def parallel_affine_impl(model_name, base_path, example_path, task_path, exp_nam
     query_affine_impl_once(copy_key, {
         "model_name": model_name,
         "temperature": temperature,
-        "max_tokens": 1024,
+        "max_tokens": max_tokens,
         "system_prompt": "You are an AI assistant tasked with reasoning and generating code.",
         "num_samples": num_samples,
         "num_workers": min(num_samples, 40),
@@ -47,6 +47,9 @@ if __name__ == "__main__":
     parser.add_argument("--num_samples", type=int, default=64)
     parser.add_argument("--base_path", type=str, required=True)
     parser.add_argument("--temperature", type=float, required=True)
+    # gpt-oss-120b at reasoning_effort=high needs a much larger budget than the
+    # 1024-token DeepSeek default; CoT eats the budget before content otherwise.
+    parser.add_argument("--max_tokens", type=int, default=1024)
     args = parser.parse_args()
     rows = []
     with open(args.input_csv, 'r') as f:
@@ -57,7 +60,7 @@ if __name__ == "__main__":
         exp_type = row['Type']
         task_path = row['Task']
         exp_name = exp_type + "/" + task_path.split('/')[-1].split('.')[0].replace('test', f'{args.num_samples}')
-        temp_dir, stats = parallel_affine_impl(args.model_name, args.base_path, args.example_path, task_path, exp_name, args.num_samples, args.temperature)
+        temp_dir, stats = parallel_affine_impl(args.model_name, args.base_path, args.example_path, task_path, exp_name, args.num_samples, args.temperature, args.max_tokens)
         row['ExpPath'] = temp_dir
         for (k, v) in stats.items():
             row[k] = v

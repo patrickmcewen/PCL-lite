@@ -1,9 +1,34 @@
+import json
 import os
 import re
 import requests
 import time
 import openai
 from pydantic import BaseModel
+
+
+# NextStep/configs/<model>.json — same schema StepGenFlow12 uses
+# ({url, model, api_key, reasoning_effort?}). PCL-lite is checked out as a
+# sibling of `configs/`, so resolve relative to this file.
+_CONFIGS_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "configs")
+)
+
+
+def _load_llm_config(model_name):
+    """Load a NextStep/configs/<model>.json file by short name.
+
+    Accepts both ``gpt-oss-120b`` and ``openai/gpt-oss-120b``-style ids;
+    strips any ``provider/`` prefix when looking up the file. Fails loud
+    if the config isn't present so callers learn about typos immediately.
+    """
+    short = model_name.split("/")[-1]
+    path = os.path.join(_CONFIGS_DIR, f"{short}.json")
+    assert os.path.exists(path), (
+        f"LLM config not found at {path}; expected NextStep/configs/{short}.json"
+    )
+    with open(path) as f:
+        return json.load(f)
 
 def print_elapsed_time(start_time, end_time):
     """Prints the elapsed time in hh:mm:ss format."""
@@ -68,9 +93,11 @@ def query(
                     print(f"Query failed {timeout} times, aborting.")
                     exit(1)
                 continue
-            response = resp.json()["choices"][0]["message"]["content"]
-            storage["usage"] = resp.json()["usage"]
-            return response
+            data = resp.json()
+            message = data["choices"][0]["message"]
+            storage["usage"] = data["usage"]
+            storage["message"] = message
+            return message["content"]
 
 def query_cache(
     cache,
@@ -256,8 +283,12 @@ def query_anthropic(
                     
                 time.sleep(min(2 ** query_tries, 60))  # Exponential backoff with 60-second cap
                 continue
-            storage["usage"] = response.json()["usage"]
-            return response.json()["content"][0]
+            data = response.json()
+            storage["usage"] = data["usage"]
+            # Capture the full content list so reasoning/thinking blocks
+            # survive — query_text only returns the first block's text.
+            storage["message"] = {"content": data["content"]}
+            return data["content"][0]
             
         except requests.exceptions.RequestException as e:
             query_tries += 1
@@ -321,9 +352,11 @@ def query_together(
                     print(f"Query failed {timeout} times, aborting.")
                     exit(1)
                 continue
-            response = resp.json()["choices"][0]["message"]["content"]
-            storage["usage"] = resp.json()["usage"]
-            return response
+            data = resp.json()
+            message = data["choices"][0]["message"]
+            storage["usage"] = data["usage"]
+            storage["message"] = message
+            return message["content"]
 
 def query_deepseek(
     prompt,
@@ -368,9 +401,68 @@ def query_deepseek(
                     print(f"Query failed {timeout} times, aborting.")
                     exit(1)
                 continue
-            response = resp.json()["choices"][0]["message"]["content"]
-            storage["usage"] = resp.json()["usage"]
-            return response
+            data = resp.json()
+            message = data["choices"][0]["message"]
+            storage["usage"] = data["usage"]
+            storage["message"] = message
+            return message["content"]
+
+def query_local(
+    prompt,
+    **kwargs,
+):
+    """Query a local OpenAI-compatible endpoint declared in NextStep/configs/.
+
+    Reads ``{url, model, api_key, reasoning_effort?}`` from
+    ``configs/<model_name>.json``. The ``api_key`` is forwarded verbatim;
+    vLLM accepts the literal string ``"None"`` when no auth is configured.
+    Returns ``message.content`` but also stashes the full message dict
+    (including ``reasoning_content`` when the server emits it) into
+    ``storage["message"]`` so callers can persist the chain-of-thought.
+    """
+    model_name = kwargs.get("model_name", "")
+    cfg = _load_llm_config(model_name)
+    temperature = kwargs.get("temperature", 1)
+    max_tokens = kwargs.get("max_tokens", 8192)
+    system = kwargs.get(
+        "system",
+        "You are an AI assistant tasked with reasoning and generating code.",
+    )
+    storage = kwargs.get("storage", {})
+
+    body = {
+        "model": cfg["model"],
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if cfg.get("reasoning_effort"):
+        body["reasoning_effort"] = cfg["reasoning_effort"]
+
+    url = f"{cfg['url']}/chat/completions"
+    headers = {"Authorization": f"Bearer {cfg['api_key']}"}
+    s = requests.Session()
+
+    query_tries = 0
+    max_retries = 6
+    while True:
+        resp = s.post(url, headers=headers, json=body, timeout=600)
+        if resp.ok:
+            data = resp.json()
+            message = data["choices"][0]["message"]
+            storage["usage"] = data.get("usage", {})
+            storage["message"] = message
+            return message["content"]
+        query_tries += 1
+        print(f"local LLM attempt {query_tries}: HTTP {resp.status_code} {resp.text[:200]}")
+        assert query_tries < max_retries, (
+            f"local LLM at {cfg['url']} failed {max_retries} times"
+        )
+        time.sleep(5)
+
 
 def query_text(
     prompt,
@@ -379,12 +471,18 @@ def query_text(
     model_name = kwargs.get("model_name", "claude-3-5-sonnet-20241022")
     if "claude" in model_name:
         return query_anthropic(prompt, **kwargs)['text']
-    elif "gpt" in model_name or "o1" in model_name:
+    # Local OpenAI-compatible endpoints (vLLM, sglang, etc.) keyed by
+    # NextStep/configs/<model>.json. Covers gpt-oss-120b, kimi-k2.6,
+    # minimax-m2.7, deepseek-v3.2 etc. that StepGenFlow12 also uses.
+    if model_name.startswith("openai/") or os.path.exists(
+        os.path.join(_CONFIGS_DIR, f"{model_name.split('/')[-1]}.json")
+    ):
+        return query_local(prompt, **kwargs)
+    if "gpt" in model_name or "o1" in model_name:
         return query(prompt, **kwargs)
-    elif model_name == "DeepSeek-V3":
+    if model_name == "DeepSeek-V3":
         return query_deepseek(prompt, **kwargs)
-    else:
-        return query_together(prompt, **kwargs)
+    return query_together(prompt, **kwargs)
 
 def clean_newline(response):
     # replace double or more newlines with a single newline
