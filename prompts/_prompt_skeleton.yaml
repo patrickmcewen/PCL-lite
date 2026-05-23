@@ -94,16 +94,24 @@ general:
 function_inventory:
   desc: |
     Map functions — use with UnaryMap / BinaryMap. Tile-in, tile-out, same shape.
-      Unary:  Square, Silu, Exp, Pow2, Rsqrt, Sqrt, RowWiseSum,
-              MulImmediate(c), AddImmediate(c), SubImmediate(c)
+      Unary:  Square, Silu, Tanh, Exp, Pow2, Rsqrt, Sqrt, RowWiseSum,
+              MulImmediate(c), AddImmediate(c), SubImmediate(c),
+              MaxImmediate(c),                    # clamp_min(x, c); c=0 -> ReLU
+              PowImmediate(c),                    # x ** c
+              MaskRow,                            # ones in the leading tile col, used to mask the first row of a tile
+              SelectToScalar,                     # passthrough; converts a Select tile to a scalar tile
+              ToConstInt(constant)                # emit a tile filled with `constant` (Uint64 sink for ToConstInt-driven ops)
       Binary: Add, Sub, Mul, Div, IsEqual,
-              Matmul(weight_transposed=False)       # tile-wise (M,K)x(K,N)
+              Matmul(weight_transposed=False),    # tile-wise (M,K)x(K,N)
+              CacheWriteAddrGen(row_offset),      # addr = a * row_offset + b
+              SetOffset, RowWiseAppend            # ragged-row plumbing; SetOffset stashes per-tile offsets that RowWiseAppend consumes
 
     Accumulation functions — use with Accum to fold trailing stream dims.
       Add, Mul, Max, RetileRow, RetileCol, SignalReqAllRead
 
     Map+Accum functions — use with BinaryMapAccum for fused matmul-reduce.
-      Matmul(weight_transposed=False)
+      Matmul(weight_transposed=False),
+      DynMatmul(weight_transposed=False)          # dynamic-shape variant for DynTile inputs
 
     Init functions — supply the initial state for Accum / BinaryMapAccum.
       Zero(shape, dtype), Empty(shape, dtype), DynEmpty(shape, dtype)
@@ -122,6 +130,7 @@ op_order:
   # --- Source / sink ops (every body() loads inputs via these and ends with one) ---
   - LinearOffChipLoad
   - SelectGen
+  - MetadataGen
   - OffChipStore
 
   # --- Core elementwise compute ---
@@ -165,6 +174,11 @@ op_order:
   - FlatReassemble
   - FlatmapFilterRowStreamify
   - FlatmapCounter
+  - ExpertAddrGen
+  - FilterLastTile
+
+  # --- KV-cache addressing ---
+  - CacheReadAddrGen
 
   # --- Dynamic-shape source/sink ---
   - DynLinearOffChipLoad

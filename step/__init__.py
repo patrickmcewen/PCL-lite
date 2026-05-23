@@ -68,5 +68,11 @@ from step_py.ops import (  # noqa: E402
     UnaryMap,
 )
 from step_py.functions import accum_fn, init_fn, map_accum_fn, map_fn  # noqa: E402
-from step_py.utility_ops import SelectGen  # noqa: E402
+from step_py.utility_ops import (  # noqa: E402
+    CacheReadAddrGen,
+    ExpertAddrGen,
+    FilterLastTile,
+    MetadataGen,
+    SelectGen,
+)
 from timing_and_emulator.functional import execute  # noqa: E402

@@ -92,16 +92,24 @@ general:
 function_inventory:
   desc: |
     Map functions — use with UnaryMap / BinaryMap. Tile-in, tile-out, same shape.
-      Unary:  Square, Silu, Exp, Pow2, Rsqrt, Sqrt, RowWiseSum,
-              MulImmediate(c), AddImmediate(c), SubImmediate(c)
+      Unary:  Square, Silu, Tanh, Exp, Pow2, Rsqrt, Sqrt, RowWiseSum,
+              MulImmediate(c), AddImmediate(c), SubImmediate(c),
+              MaxImmediate(c),                    # clamp_min(x, c); c=0 -> ReLU
+              PowImmediate(c),                    # x ** c
+              MaskRow,                            # ones in the leading tile col, used to mask the first row of a tile
+              SelectToScalar,                     # passthrough; converts a Select tile to a scalar tile
+              ToConstInt(constant)                # emit a tile filled with `constant` (Uint64 sink for ToConstInt-driven ops)
       Binary: Add, Sub, Mul, Div, IsEqual,
-              Matmul(weight_transposed=False)       # tile-wise (M,K)x(K,N)
+              Matmul(weight_transposed=False),    # tile-wise (M,K)x(K,N)
+              CacheWriteAddrGen(row_offset),      # addr = a * row_offset + b
+              SetOffset, RowWiseAppend            # ragged-row plumbing; SetOffset stashes per-tile offsets that RowWiseAppend consumes
 
     Accumulation functions — use with Accum to fold trailing stream dims.
       Add, Mul, Max, RetileRow, RetileCol, SignalReqAllRead
 
     Map+Accum functions — use with BinaryMapAccum for fused matmul-reduce.
-      Matmul(weight_transposed=False)
+      Matmul(weight_transposed=False),
+      DynMatmul(weight_transposed=False)          # dynamic-shape variant for DynTile inputs
 
     Init functions — supply the initial state for Accum / BinaryMapAccum.
       Zero(shape, dtype), Empty(shape, dtype), DynEmpty(shape, dtype)
@@ -114,7 +122,7 @@ ops:
     (tile index = sum(idx[i] * stride[i])). Output stream shape is
     ``(1,) + out_shape_tiled`` with tile dtype ``Tile(tile_row, tile_col)``;
     set ``transposed=True`` to swap (tile_row, tile_col) on the way out.
-    Signature: step.LinearOffChipLoad(underlying, stride, out_shape_tiled, tile_row, tile_col, par_dispatch, mock_bf16=<...>, save_npy=<...>, transposed=<...>)
+    Signature: step.LinearOffChipLoad(underlying, stride, out_shape_tiled, tile_row, tile_col, par_dispatch, mock_bf16=<...>, save_npy=<...>, transposed=<...>, start_tile_idx=<...>)
   examples:
   - |
     import step
@@ -301,6 +309,66 @@ ops:
             num_consumers=E_value,
         )
         return step.OffChipStore(graph, (parts, 0), par_dispatch=1)
+- name: MetadataGen
+  desc: |
+    Source op for an address / metadata stream. Wraps a ``torch.Tensor``
+    of arbitrary shape and emits it as a Tile(Uint64, (1,1)) stream whose
+    stream shape is ``(1,) + tensor.shape`` — each scalar in the underlying
+    tensor becomes a 1x1 uint64 tile. Use this for static address streams
+    (e.g. feeding ``raddr`` into ``RandomOffChipLoad``) where every element
+    of the underlying is already a tile-index and you don't want
+    ``LinearOffChipLoad`` to wrap them into multi-element tiles. The
+    underlying tensor is captured at build time, just like ``SelectGen``,
+    so no edge to a producer is created in the graph.
+    Signature: step.MetadataGen(tensor)
+  examples:
+  - |
+    import step
+    from sympy import Symbol
+    import torch
+    from tools.get_indices import generate_multi_hot, generate_binary_tensor
+
+    torch.manual_seed(42)
+    E = Symbol("E")
+    M = Symbol("M")
+    N = Symbol("N")
+    K = Symbol("K")
+    D = Symbol("D")
+    M_value = 5
+    N_value = 7
+    K_value = 9
+    D_value = 16
+    ctx = {
+        M: M_value,
+        N: N_value,
+        K: K_value,
+        D: D_value
+    }
+
+
+    # MetadataGen wraps a torch.Tensor and emits one Tile(Uint64,(1,1))
+    # per scalar. Underlying values become the streamed tile contents.
+    addr_t = torch.arange(M_value, dtype=torch.float32)
+
+
+    input_data = {
+    }
+    def test():
+        graph = step.Graph()
+        out = body(graph, )
+        out = step.execute(graph, out, input_tensors={})
+        S0_ref = torch.arange(M_value, dtype=torch.float32)
+        assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
+        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+
+    def body(graph, ):
+        # MetadataGen: source op for an address / index stream. Stream shape
+        # is (1,) + tensor.shape; each scalar in `tensor` becomes a 1x1 tile.
+        # Use this (rather than LinearOffChipLoad) for static address streams
+        # consumed by RandomOffChipLoad's `raddr`, CacheReadAddrGen's `idx`/
+        # `seq_len`, or any op expecting Tile(Uint64, (1,1)) tiles.
+        addr_stream = step.MetadataGen(tensor=addr_t)
+        return step.OffChipStore(graph, addr_stream, par_dispatch=1)
 - name: OffChipStore
   desc: |
     Sink op: write a stream of tiles back to off-chip memory. The harness
@@ -1453,13 +1521,15 @@ ops:
         return step.OffChipStore(graph, merged, par_dispatch=1)
 - name: FlatPartition
   desc: |
-    Route an input stream's tiles to one of ``num_consumers`` output
-    streams using a ``control`` multihot. For each tile t and consumer i,
-    if ``control[t, i] > 0`` the tile is appended to consumer i's output.
-    Each consumer's outermost dim is a DynDim sized by how many tiles
-    route to it. Requires ``input.rank == control.rank + partition_rank``;
-    inverse of FlatReassemble. Core building block for MoE expert
-    dispatch.
+    Route an input stream's tile groups to one of ``num_consumers``
+    output streams using a ``control`` multihot. Each control element
+    governs one ``partition_rank``-deep sub-stream of the input: for
+    consumer i, if ``control[t, i] > 0`` the entire sub-stream is routed
+    to consumer i. Each consumer's outermost dim is a DynDim sized by how
+    many sub-streams route to it; the inner ``partition_rank`` stream dims
+    are inherited from the input. Requires
+    ``input.rank == control.rank + partition_rank``; inverse of
+    FlatReassemble. Core building block for MoE expert dispatch.
     Signature: step.FlatPartition(graph, input, control, partition_rank, switch_cycles, write_back_mu, num_consumers)
   examples:
   - |
@@ -1611,12 +1681,14 @@ ops:
 - name: FlatReassemble
   desc: |
     Merge ``len(inputs)`` streams back into one according to a control
-    multihot. For each output position t, gather one tile from every
-    input i with ``control[t, i] > 0`` (advancing per-input read pointers).
-    Output's outermost dim = control's stream tokens × number of active
-    inputs per token. Inverse of FlatPartition; the typical use is
-    combining per-expert outputs back into a single sequence after MoE
-    routing.
+    multihot. For each output position t, gather one ``reassemble_rank``-d
+    sub-tensor from every input i with ``control[t, i] > 0`` (advancing
+    per-input read pointers). Output's outermost dim = control's stream
+    tokens × number of active inputs per token; the trailing
+    ``reassemble_rank`` stream dims are inherited from the inputs (which
+    must all agree on those dims). Inverse of FlatPartition; the typical
+    use is combining per-expert outputs back into a single sequence after
+    MoE routing.
     Signature: step.FlatReassemble(graph, inputs, control, reassemble_rank, switch_cycles, write_back_mu)
   examples:
   - |
@@ -1835,6 +1907,224 @@ ops:
         )
         counter = step.FlatmapCounter(graph, n_loaded)
         return step.OffChipStore(graph, counter, par_dispatch=1)
+- name: ExpertAddrGen
+  desc: |
+    ExpertAddrGen: compute expert weight tile addresses.
+
+    Input must be a rank-0 stream (shape (N,) with a one-hot selector at the
+    inner dim) so that it matches the Rust simulator's constraint
+    (step-perf/src/operator/flatmap.rs:319). For each element, emits
+    num_tile_per_expert sequential addresses starting at
+    expert_addr_base + expert_idx * num_tile_per_expert.
+
+    Output shape: (N, num_tile_per_expert, 1, 1, 1)
+    Signature: step.ExpertAddrGen(graph, input, num_tile_per_expert, expert_addr_base)
+  examples:
+  - |
+    import step
+    from sympy import Symbol
+    import torch
+    from tools.get_indices import generate_multi_hot, generate_binary_tensor
+
+    torch.manual_seed(42)
+    E = Symbol("E")
+    M = Symbol("M")
+    N = Symbol("N")
+    K = Symbol("K")
+    D = Symbol("D")
+    M_value = 5
+    N_value = 7
+    K_value = 9
+    D_value = 16
+    ctx = {
+        M: M_value,
+        N: N_value,
+        K: K_value,
+        D: D_value
+    }
+
+
+    E_value = 2
+    ctx[E] = E_value
+    # Rank-0 one-hot selector (a single MultiHot(E) element). The Rust
+    # simulator's ExpertAddrGen only accepts rank-0 input streams; for
+    # multi-dim expert dispatch use FlatPartition instead.
+    expert_onehot = torch.zeros(E_value)
+    expert_onehot[1] = 1.0
+    num_tile_per_expert = 4
+    expert_addr_base = 100
+
+
+    input_data = {
+    }
+    def test():
+        graph = step.Graph()
+        out = body(graph, )
+        out = step.execute(graph, out, input_tensors={})
+        S0_ref = torch.arange(num_tile_per_expert).float() + expert_addr_base + int(expert_onehot.argmax().item()) * num_tile_per_expert
+        assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
+        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+
+    def body(graph, ):
+        # ExpertAddrGen: given a one-hot expert selector, emit
+        # num_tile_per_expert sequential tile addresses starting at
+        # expert_addr_base + expert_idx * num_tile_per_expert. Input MUST be
+        # a rank-0 Select stream (a single one-hot vector).
+        ctrl = step.SelectGen(is_multihot=True, tensor=expert_onehot, n=E_value)
+        addrs = step.ExpertAddrGen(
+            graph, ctrl,
+            num_tile_per_expert=num_tile_per_expert,
+            expert_addr_base=expert_addr_base,
+        )
+        return step.OffChipStore(graph, addrs, par_dispatch=1)
+- name: FilterLastTile
+  desc: |
+    FilterLastTile: produce a multihot marking last vs non-last tiles.
+
+    Input is a sequence length stream (tile: 1x1). For each element with
+    value N, produces N multihot entries: [0,1] for positions 0..N-2 (non-last),
+    [1,0] for position N-1 (last).
+    Output shape: (*input_stream, DynN, 2) — a multihot with 2 categories.
+
+    Column convention matches step-perf/operator/flatmap.rs::FilterLastTile:
+    col 0 = "is last", col 1 = "is non-last". Downstream FlatPartition routes
+    consumer 0 := last-tile branch, consumer 1 := non-last branch.
+    Signature: step.FilterLastTile(graph, input)
+  examples:
+  - |
+    import step
+    from sympy import Symbol
+    import torch
+    from tools.get_indices import generate_multi_hot, generate_binary_tensor
+
+    torch.manual_seed(42)
+    E = Symbol("E")
+    M = Symbol("M")
+    N = Symbol("N")
+    K = Symbol("K")
+    D = Symbol("D")
+    M_value = 5
+    N_value = 7
+    K_value = 9
+    D_value = 16
+    ctx = {
+        M: M_value,
+        N: N_value,
+        K: K_value,
+        D: D_value
+    }
+
+
+    # Per-element sequence-length scalars feed FilterLastTile. Each
+    # length n becomes n MultiHot(2) tiles in the output: [0,1] for
+    # positions 0..n-2 (non-last) and [1,0] for n-1 (last).
+    seq_lens = torch.full((M_value,), 3.0)
+
+
+    input_data = {
+        'E0': torch.randn(M_value, N_value),
+    }
+    def test():
+        graph = step.Graph()
+        out = body(graph, input_data['E0'])
+        out = step.execute(graph, out, input_tensors={})
+        S0_ref = input_data['E0']
+        assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
+        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+
+    # Inputs (raw torch tensors passed positionally to body()):
+    #   E0: dtype=fp32, dims=[N, M]
+    def body(graph, E0):
+        # FilterLastTile produces a MultiHot(2) stream typically wired to
+        # FlatPartition's `control` to split a sequence into last-tile vs
+        # non-last-tile branches. Here we drive it as a side-effect node
+        # (the OffChipStore emits the input E0 unchanged) so the example
+        # is self-contained; a real kernel routes the multihot output into
+        # downstream FlatPartition.
+        E0_stream = step.LinearOffChipLoad(
+            underlying=E0,
+            stride=(1, 1),
+            out_shape_tiled=(M_value, 1),
+            tile_row=1, tile_col=N_value,
+            par_dispatch=1,
+        )
+        seq_len_stream = step.MetadataGen(tensor=seq_lens)
+        last_mh = step.FilterLastTile(graph, seq_len_stream)
+        return step.OffChipStore(graph, E0_stream, par_dispatch=1)
+- name: CacheReadAddrGen
+  desc: |
+    CacheReadAddrGen: compute KV cache tile addresses.
+
+    For each (batch, head) element with sequence length N, generates
+    linear tile addresses: idx * row_offset + col for col in 0..N-1.
+    Output shape: (*idx_stream_shape, DynN, 1, 1)
+    Signature: step.CacheReadAddrGen(graph, idx, seq_len, row_offset)
+  examples:
+  - |
+    import step
+    from sympy import Symbol
+    import torch
+    from tools.get_indices import generate_multi_hot, generate_binary_tensor
+
+    torch.manual_seed(42)
+    E = Symbol("E")
+    M = Symbol("M")
+    N = Symbol("N")
+    K = Symbol("K")
+    D = Symbol("D")
+    M_value = 5
+    N_value = 7
+    K_value = 9
+    D_value = 16
+    ctx = {
+        M: M_value,
+        N: N_value,
+        K: K_value,
+        D: D_value
+    }
+
+
+    # idx and seq_len streams feed CacheReadAddrGen. For each scalar
+    # idx with length n, the op emits n addresses
+    #   idx * row_offset, idx * row_offset + 1, ..., idx * row_offset + n - 1
+    # along a new innermost DynDim. Padded to max(n) per outer batch.
+    idx_t = torch.arange(M_value, dtype=torch.float32)
+    seq_len_t = torch.full((M_value,), 4.0)
+    row_offset = 16
+
+
+    input_data = {
+        'E0': torch.randn(M_value, N_value),
+    }
+    def test():
+        graph = step.Graph()
+        out = body(graph, input_data['E0'])
+        out = step.execute(graph, out, input_tensors={})
+        S0_ref = input_data['E0']
+        assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
+        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+
+    # Inputs (raw torch tensors passed positionally to body()):
+    #   E0: dtype=fp32, dims=[N, M]
+    def body(graph, E0):
+        # CacheReadAddrGen: builds the KV-cache tile-address stream that
+        # RandomOffChipLoad consumes as `raddr`. Output stream shape is
+        # idx.stream.shape + (DynN,) with Tile(Uint64, (1,1)). Self-contained
+        # smoke: drive the op as a side node and emit E0 as the data sink;
+        # a real kernel feeds the addresses into RandomOffChipLoad.
+        E0_stream = step.LinearOffChipLoad(
+            underlying=E0,
+            stride=(1, 1),
+            out_shape_tiled=(M_value, 1),
+            tile_row=1, tile_col=N_value,
+            par_dispatch=1,
+        )
+        idx_stream = step.MetadataGen(tensor=idx_t)
+        seq_len_stream = step.MetadataGen(tensor=seq_len_t)
+        addr_stream = step.CacheReadAddrGen(
+            graph, idx_stream, seq_len_stream, row_offset=row_offset,
+        )
+        return step.OffChipStore(graph, E0_stream, par_dispatch=1)
 - name: DynLinearOffChipLoad
   desc: |
     Source op variant of LinearOffChipLoad for dynamic-shape inputs. The
@@ -2198,7 +2488,7 @@ ops:
 - name: LinearOffChipLoadRef
   desc: |
     LinearOffChipLoadRef: load weight tiles, broadcast over ref dims.
-    Signature: step.LinearOffChipLoadRef(graph, ref, underlying, stride, out_shape_tiled, tile_row, tile_col, par_dispatch, mock_bf16=<...>, transposed=<...>, trigger_rank=<...>)
+    Signature: step.LinearOffChipLoadRef(graph, ref, underlying, stride, out_shape_tiled, tile_row, tile_col, par_dispatch, mock_bf16=<...>, transposed=<...>, trigger_rank=<...>, start_tile_idx=<...>)
   examples:
   - |
     import step

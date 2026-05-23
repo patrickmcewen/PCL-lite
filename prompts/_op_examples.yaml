@@ -1118,6 +1118,133 @@ DynStreamify:
     #       repeat_rank=<r>, bufferized_rank=<bufferized_rank>,
     #   )
     return step.OffChipStore(graph, E0, par_dispatch=1)
+MetadataGen:
+- inputs: []
+  global: |
+    # MetadataGen wraps a torch.Tensor and emits one Tile(Uint64,(1,1))
+    # per scalar. Underlying values become the streamed tile contents.
+    addr_t = torch.arange(M_value, dtype=torch.float32)
+  outputs:
+  - name: S0
+    dtype: fp32
+    dims: [M]
+    data_transform:
+    - |
+      torch.arange(M_value, dtype=torch.float32)
+  impl: |
+    # MetadataGen: source op for an address / index stream. Stream shape
+    # is (1,) + tensor.shape; each scalar in `tensor` becomes a 1x1 tile.
+    # Use this (rather than LinearOffChipLoad) for static address streams
+    # consumed by RandomOffChipLoad's `raddr`, CacheReadAddrGen's `idx`/
+    # `seq_len`, or any op expecting Tile(Uint64, (1,1)) tiles.
+    addr_stream = step.MetadataGen(tensor=addr_t)
+    return step.OffChipStore(graph, addr_stream, par_dispatch=1)
+ExpertAddrGen:
+- inputs: []
+  global: |
+    E_value = 2
+    ctx[E] = E_value
+    # Rank-0 one-hot selector (a single MultiHot(E) element). The Rust
+    # simulator's ExpertAddrGen only accepts rank-0 input streams; for
+    # multi-dim expert dispatch use FlatPartition instead.
+    expert_onehot = torch.zeros(E_value)
+    expert_onehot[1] = 1.0
+    num_tile_per_expert = 4
+    expert_addr_base = 100
+  outputs:
+  - name: S0
+    dtype: fp32
+    dims: [num_tile_per_expert]
+    data_transform:
+    - |
+      torch.arange(num_tile_per_expert).float() + expert_addr_base + int(expert_onehot.argmax().item()) * num_tile_per_expert
+  impl: |
+    # ExpertAddrGen: given a one-hot expert selector, emit
+    # num_tile_per_expert sequential tile addresses starting at
+    # expert_addr_base + expert_idx * num_tile_per_expert. Input MUST be
+    # a rank-0 Select stream (a single one-hot vector).
+    ctrl = step.SelectGen(is_multihot=True, tensor=expert_onehot, n=E_value)
+    addrs = step.ExpertAddrGen(
+        graph, ctrl,
+        num_tile_per_expert=num_tile_per_expert,
+        expert_addr_base=expert_addr_base,
+    )
+    return step.OffChipStore(graph, addrs, par_dispatch=1)
+FilterLastTile:
+- inputs:
+  - name: E0
+    dtype: fp32
+    dims: [N, M]
+    data_gen: torch.randn
+  global: |
+    # Per-element sequence-length scalars feed FilterLastTile. Each
+    # length n becomes n MultiHot(2) tiles in the output: [0,1] for
+    # positions 0..n-2 (non-last) and [1,0] for n-1 (last).
+    seq_lens = torch.full((M_value,), 3.0)
+  outputs:
+  - name: S0
+    dtype: fp32
+    dims: [N, M]
+    data_transform:
+    - |
+      input_data['E0']
+  impl: |
+    # FilterLastTile produces a MultiHot(2) stream typically wired to
+    # FlatPartition's `control` to split a sequence into last-tile vs
+    # non-last-tile branches. Here we drive it as a side-effect node
+    # (the OffChipStore emits the input E0 unchanged) so the example
+    # is self-contained; a real kernel routes the multihot output into
+    # downstream FlatPartition.
+    E0_stream = step.LinearOffChipLoad(
+        underlying=E0,
+        stride=(1, 1),
+        out_shape_tiled=(M_value, 1),
+        tile_row=1, tile_col=N_value,
+        par_dispatch=1,
+    )
+    seq_len_stream = step.MetadataGen(tensor=seq_lens)
+    last_mh = step.FilterLastTile(graph, seq_len_stream)
+    return step.OffChipStore(graph, E0_stream, par_dispatch=1)
+CacheReadAddrGen:
+- inputs:
+  - name: E0
+    dtype: fp32
+    dims: [N, M]
+    data_gen: torch.randn
+  global: |
+    # idx and seq_len streams feed CacheReadAddrGen. For each scalar
+    # idx with length n, the op emits n addresses
+    #   idx * row_offset, idx * row_offset + 1, ..., idx * row_offset + n - 1
+    # along a new innermost DynDim. Padded to max(n) per outer batch.
+    idx_t = torch.arange(M_value, dtype=torch.float32)
+    seq_len_t = torch.full((M_value,), 4.0)
+    row_offset = 16
+  outputs:
+  - name: S0
+    dtype: fp32
+    dims: [N, M]
+    data_transform:
+    - |
+      input_data['E0']
+  impl: |
+    # CacheReadAddrGen: builds the KV-cache tile-address stream that
+    # RandomOffChipLoad consumes as `raddr`. Output stream shape is
+    # idx.stream.shape + (DynN,) with Tile(Uint64, (1,1)). Self-contained
+    # smoke: drive the op as a side node and emit E0 as the data sink;
+    # a real kernel feeds the addresses into RandomOffChipLoad.
+    E0_stream = step.LinearOffChipLoad(
+        underlying=E0,
+        stride=(1, 1),
+        out_shape_tiled=(M_value, 1),
+        tile_row=1, tile_col=N_value,
+        par_dispatch=1,
+    )
+    idx_stream = step.MetadataGen(tensor=idx_t)
+    seq_len_stream = step.MetadataGen(tensor=seq_len_t)
+    addr_stream = step.CacheReadAddrGen(
+        graph, idx_stream, seq_len_stream, row_offset=row_offset,
+    )
+    return step.OffChipStore(graph, E0_stream, par_dispatch=1)
 Inner-dim row-wise reduction:
 - inputs:
   - name: E0
