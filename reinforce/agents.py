@@ -13,10 +13,11 @@ from reinforce.base import Agent, Storage
 # --- Static "no torch-bypass" gate ---------------------------------------
 # Source-of-truth list of step.* ops that legitimately consume the body's
 # raw tensor inputs. Any other use of an input tensor (passing it to
-# torch math, the `@` operator, indexing, helper functions, etc.) is a
-# bypass — the model is computing the gold answer in plain torch and
-# wrapping the result in a source op so the harness's identity load→store
-# pipes a precomputed tensor straight through.
+# torch math, the `@` operator, helper functions, etc.) is a bypass —
+# the model is computing the gold answer in plain torch and wrapping the
+# result in a source op so the harness's identity load→store pipes a
+# precomputed tensor straight through. View-creating ops (`.t()`,
+# `.reshape(...)`, `[p]`) are permitted *inside* a source-op kwarg.
 _SOURCE_OPS = frozenset({
     "LinearOffChipLoad",
     "RandomOffChipLoad",
@@ -54,8 +55,10 @@ def _is_source_op_call(node):
 def _classify_input_use(node):
     """Walk up from an input reference; True iff the chain terminates at
     an ``underlying=``/``tensor=`` kwarg of a source-op call, traversing
-    only attribute access and method calls (so ``Ei.reshape(...)``-style
-    view ops inside the kwarg are allowed)."""
+    attribute access, method calls, and subscript indexing (so
+    ``Ei.reshape(...)`` and ``Ei[p]`` view ops inside the kwarg are
+    allowed). Any input reference *inside* the subscript's index gets
+    its own bypass check via ``_walk_no_nested``."""
     cur = node
     while True:
         parent = getattr(cur, "_parent", None)
@@ -65,6 +68,9 @@ def _classify_input_use(node):
             cur = parent
             continue
         if isinstance(parent, ast.Call) and parent.func is cur:
+            cur = parent
+            continue
+        if isinstance(parent, ast.Subscript) and parent.value is cur:
             cur = parent
             continue
         if isinstance(parent, ast.keyword) and parent.value is cur:

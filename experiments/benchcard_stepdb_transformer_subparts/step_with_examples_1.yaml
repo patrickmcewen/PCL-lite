@@ -1530,8 +1530,6 @@ examples:
 - dims:
     M: 32
     K: 48
-    tile_m: 16
-    tile_k: 16
   inputs:
   - name: A
     dtype: fp32
@@ -1551,22 +1549,119 @@ examples:
   impl: |-
     A = step.LinearOffChipLoad(
         underlying=A,
-        stride=(3, 1),
-        out_shape_tiled=(2, 3),
-        tile_row=16, tile_col=16,
+        stride=(1, 1),
+        out_shape_tiled=(M_value, 1),
+        tile_row=1, tile_col=K_value,
         par_dispatch=1,
     )
     B = step.LinearOffChipLoad(
         underlying=B,
-        stride=(3, 1),
-        out_shape_tiled=(2, 3),
-        tile_row=16, tile_col=16,
+        stride=(1, 1),
+        out_shape_tiled=(M_value, 1),
+        tile_row=1, tile_col=K_value,
         par_dispatch=1,
     )
-    C = step.BinaryMap(
+    S0 = step.BinaryMap(
         graph, A, B,
         fn=step.map_fn.Add(),
         write_back_mu=False,
         compute_bw=1024,
     )
-    return step.OffChipStore(graph, C, par_dispatch=1)
+    return step.OffChipStore(graph, S0, par_dispatch=1)
+- dims:
+    M: 128
+    K: 64
+  inputs:
+  - name: input
+    dtype: fp32
+    dims: [K, M]
+    data_gen: torch.randn
+  outputs:
+  - name: S0
+    dtype: fp32
+    dims: [K, M]
+    data_transform:
+    - |
+      norm = input_data['input'].pow(2).mean(dim=-1, keepdim=True)
+      input_data['input'] * torch.rsqrt(norm + 1e-5)
+  impl: |-
+    input = step.LinearOffChipLoad(
+        underlying=input,
+        stride=(1, 1),
+        out_shape_tiled=(M_value, 1),
+        tile_row=1, tile_col=K_value,
+        par_dispatch=1,
+    )
+    # square each element
+    sq = step.UnaryMap(
+        graph, input,
+        fn=step.map_fn.Square(),
+        write_back_mu=False,
+        compute_bw=1024,
+    )
+    # sum squares across the innermost (K) dimension
+    sum_sq = step.UnaryMap(
+        graph, sq,
+        fn=step.map_fn.RowWiseSum(),
+        write_back_mu=False,
+        compute_bw=1024,
+    )
+    # compute mean of squares: divide by K
+    mean_sq = step.UnaryMap(
+        graph, sum_sq,
+        fn=step.map_fn.MulImmediate(1.0 / K_value),
+        write_back_mu=False,
+        compute_bw=1024,
+    )
+    # add epsilon for stability
+    mean_eps = step.UnaryMap(
+        graph, mean_sq,
+        fn=step.map_fn.AddImmediate(1e-5),
+        write_back_mu=False,
+        compute_bw=1024,
+    )
+    # rsqrt of (mean + eps)
+    scale = step.UnaryMap(
+        graph, mean_eps,
+        fn=step.map_fn.Rsqrt(),
+        write_back_mu=False,
+        compute_bw=1024,
+    )
+    # apply the scaling factor to the original input
+    out = step.BinaryMap(
+        graph, input, scale,
+        fn=step.map_fn.Mul(),
+        write_back_mu=False,
+        compute_bw=1024,
+    )
+    return step.OffChipStore(graph, out, par_dispatch=1)
+- dims:
+    M: 32
+    N: 512
+    D: 64
+  inputs:
+  - name: Q
+    dtype: fp32
+    dims: [D, M]
+    data_gen: torch.randn
+  - name: K
+    dtype: fp32
+    dims: [D, N]
+    data_gen: torch.randn
+  - name: V
+    dtype: fp32
+    dims: [D, N]
+    data_gen: torch.randn
+  outputs:
+  - name: S0
+    dtype: fp32
+    dims: [D, M]
+    data_transform:
+    - |
+      scores = input_data['Q'] @ input_data['K'].T
+      row_max = scores.max(dim=-1, keepdim=True).values
+      exp_scores = torch.exp(scores - row_max)
+      context = exp_scores @ input_data['V']
+      norm_attn = exp_scores.sum(dim=-1, keepdim=True)
+      context / norm_attn
+  impl: "# Load Q and K as streams tiled with scalar tiles, broadcasting across the\n# token dimension (N) and reducing over the feature dimension (D).\nQ_stream = step.LinearOffChipLoad(\n    underlying=Q,\n    stride=(D_value, 0, 1),\n    out_shape_tiled=(M_value, N_value, D_value),\n    tile_row=1, tile_col=1,\n    par_dispatch=1,\n)\nK_stream = step.LinearOffChipLoad(\n    underlying=K,\n    stride=(0, D_value, 1),\n    out_shape_tiled=(M_value, N_value, D_value),\n    tile_row=1, tile_col=1,\n    par_dispatch=1,\n)\n# Scores = Q @ K\u1D40  (reduce over D)\nscores = step.BinaryMapAccum(\n    graph, Q_stream, K_stream,\n    fn=step.map_accum_fn.Matmul(),\n    init_fn=step.init_fn.Zero(shape=(1, 1), dtype=step.Float32()),\n    rank=1,\n    write_back_mu=False,\n    compute_bw=1024,\n)\n# Row\u2011wise max for numerical stability\nrow_max = step.Accum(\n    graph, scores,\n    output_stream_dtype=step.Tile(step.Float32(), (1, 1)),\n    fn=step.accum_fn.Max(),\n    init_fn=step.init_fn.Empty(shape=(1, 1), dtype=step.Float32()),\n    accum_rank=1,\n    write_back_mu=False,\n    compute_bw=1024,\n)\n# Broadcast the max across the N dimension\nrow_max_rep = step.RepeatStatic(graph, row_max, repeat_factor=N_value)\n# Subtract max and exponentiate\nscores_centered = step.BinaryMap(\n    graph, scores, row_max_rep,\n    fn=step.map_fn.Sub(),\n    write_back_mu=False,\n    compute_bw=1024,\n)\nexp_scores = step.UnaryMap(\n    graph, scores_centered,\n    fn=step.map_fn.Exp(),\n    write_back_mu=False,\n    compute_bw=1024,\n)\n# Sum of exponentiated scores per row (normalizer)\nsum_exp = step.Accum(\n    graph, exp_scores,\n    output_stream_dtype=step.Tile(step.Float32(), (1, 1)),\n    fn=step.accum_fn.Add(),\n    init_fn=step.init_fn.Zero(shape=(1, 1), dtype=step.Float32()),\n    accum_rank=1,\n    write_back_mu=False,\n    compute_bw=1024,\n)\n# Broadcast the normalizer across N for division\nsum_exp_rep = step.RepeatStatic(graph, sum_exp, repeat_factor=N_value)\n# Normalized attention weights\nnorm_scores = step.BinaryMap(\n    graph, exp_scores, sum_exp_rep,\n    fn=step.map_fn.Div(),\n    write_back_mu=False,\n    compute_bw=1024,\n)\n# Load V as a stream of row\u2011vectors (tile shape 1\xD7D), broadcasting over M\nV_stream = step.LinearOffChipLoad(\n    underlying=V,\n    stride=(0, 1),\n    out_shape_tiled=(M_value, N_value),\n    tile_row=1, tile_col=D_value,\n    par_dispatch=1,\n)\n# Weighted sum of V using the normalized scores (Matmul per tile)\ncontext_partial = step.BinaryMap(\n    graph, norm_scores, V_stream,\n    fn=step.map_fn.Matmul(),\n    write_back_mu=False,\n    compute_bw=1024,\n)\n# Reduce over N to obtain the final context vectors\ncontext = step.Accum(\n    graph, context_partial,\n    output_stream_dtype=step.Tile(step.Float32(), (1, D_value)),\n    fn=step.accum_fn.Add(),\n    init_fn=step.init_fn.Zero(shape=(1, D_value), dtype=step.Float32()),\n    accum_rank=1,\n    write_back_mu=False,\n    compute_bw=1024,\n)\nreturn step.OffChipStore(graph, context, par_dispatch=1)"

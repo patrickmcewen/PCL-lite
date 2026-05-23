@@ -76,6 +76,14 @@ general:
       - `step.DynLinearOffChipLoad(...)` — dynamic-shape tile streams when
         outer dims aren't known at build time.
 
+    Stride convention (LinearOffChipLoad / DynLinearOffChipLoad /
+    RandomOffChipLoad): `stride` and `out_shape_tiled` define how tile
+    indices map to positions in the underlying tensor's tile grid.
+      - Advancing dim: `stride[i] = grid_cols_per_step` — tiles advance
+        through the grid along this dim.
+      - Broadcast dim: `stride[i] = 0` — same tile replicated along this
+        dim (use when a weight/scale must be repeated across tokens).
+
     Op-call conventions:
       - `write_back_mu=False` for compute and transform ops unless the
         immediate consumer is a `Bufferize` (then `True`).
@@ -133,6 +141,33 @@ ops:
           par_dispatch=1,
       )
       return step.OffChipStore(graph, E0, par_dispatch=1)
+  - inputs:
+    - name: W
+      dtype: fp32
+      dims: [N, M]
+      data_gen: torch.randn
+    outputs:
+    - name: S0
+      dtype: fp32
+      dims: [N, M, K]
+      data_transform:
+      - |
+        input_data['W'].unsqueeze(0).expand(K_value, M_value, N_value)
+    impl: |
+      # Broadcast-weight pattern: capture the whole (M, N) tensor as one tile
+      # (tile_row=M, tile_col=N gives a grid of (1, 1)) and replay it K
+      # times along an outer stream dim. `stride=(0,)` is the per-stream-dim
+      # advance into the underlying grid; 0 means broadcast — every stream
+      # step reads the same grid cell. Used in prefill_transformer_simple to
+      # share a Q/K/V projection slice across the token stream.
+      W_stream = step.LinearOffChipLoad(
+          underlying=W,
+          stride=(0,),
+          out_shape_tiled=(K_value,),
+          tile_row=M_value, tile_col=N_value,
+          par_dispatch=1,
+      )
+      return step.OffChipStore(graph, W_stream, par_dispatch=1)
 - name: SelectGen
   desc: |
     Source op for one-hot / multi-hot routing tensors. Turns a fp32
@@ -393,57 +428,53 @@ ops:
     Signature: step.BinaryMapAccum(graph, in1, in2, fn, init_fn, rank, write_back_mu, compute_bw=<...>)
   examples:
   - inputs:
-    - name: E0
+    - name: A
       dtype: fp32
-      dims: [N, K, M]
+      dims: [K, M]
       data_gen: torch.randn
-    - name: E1
+    - name: B
       dtype: fp32
-      dims: [D, K, M]
+      dims: [N, K]
       data_gen: torch.randn
     outputs:
     - name: S0
       dtype: fp32
-      dims: [D, N, M]
+      dims: [N, M]
       data_transform:
       - |
-        torch.einsum('mkn,mkd->mnd', input_data['E0'], input_data['E1'])
+        input_data['A'] @ input_data['B']
     impl: |
-      E0 = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(K_value, 1, 1),
-          out_shape_tiled=(M_value, K_value, 1),
-          tile_row=1, tile_col=N_value,
+      # Canonical GEMM C = A @ B as a fused matmul-reduce. A is (M, K), B is
+      # (K, N), C is (M, N). Both loads use the same (M, N, K) stream-shape;
+      # BinaryMapAccum(rank=1) folds the inner K dim. The stride conv is
+      # easy to read here:
+      #   A grid (M, K): advance M (stride=K), broadcast N (stride=0),
+      #     advance K (stride=1).
+      #   B grid (K, N): broadcast M (stride=0), advance N (stride=1),
+      #     advance K (stride=N — one full grid row).
+      A_stream = step.LinearOffChipLoad(
+          underlying=A,
+          stride=(K_value, 0, 1),
+          out_shape_tiled=(M_value, N_value, K_value),
+          tile_row=1, tile_col=1,
           par_dispatch=1,
       )
-      E1 = step.LinearOffChipLoad(
-          underlying=E1,
-          stride=(K_value, 1, 1),
-          out_shape_tiled=(M_value, K_value, 1),
-          tile_row=1, tile_col=D_value,
+      B_stream = step.LinearOffChipLoad(
+          underlying=B,
+          stride=(0, 1, N_value),
+          out_shape_tiled=(M_value, N_value, K_value),
+          tile_row=1, tile_col=1,
           par_dispatch=1,
       )
-      # bmm via outer-product matmul: per (m, k), compute outer(E0[m,k,:],
-      # E1[m,k,:]) of shape (N, D); sum over K.
-      # E0 column-tile (N, 1) via transposed reload; E1 keeps the default
-      # row-tile (1, D).
-      E0_col = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(K_value, 1, 1),
-          out_shape_tiled=(M_value, K_value, 1),
-          tile_row=1, tile_col=N_value,
-          par_dispatch=1,
-          transposed=True,
-      )
-      E2 = step.BinaryMapAccum(
-          graph, E0_col, E1,
+      C = step.BinaryMapAccum(
+          graph, A_stream, B_stream,
           fn=step.map_accum_fn.Matmul(),
-          init_fn=step.init_fn.Zero(shape=(N_value, D_value), dtype=step.Float32()),
-          rank=2,
+          init_fn=step.init_fn.Zero(shape=(1, 1), dtype=step.Float32()),
+          rank=1,
           write_back_mu=False,
           compute_bw=1024,
       )
-      return step.OffChipStore(graph, E2, par_dispatch=1)
+      return step.OffChipStore(graph, C, par_dispatch=1)
 - name: Promote
   desc: |
     Insert a singleton stream dim at ``promote_rank`` counted from the
@@ -566,39 +597,30 @@ ops:
       - |
         input_data['E0'].unsqueeze(1).expand(K_value, N_value, M_value)
     impl: |
-      E0 = step.LinearOffChipLoad(
+      # RepeatRef broadcasts an input stream across the trailing dim of a
+      # ref stream. Constraint: input.shape == ref.shape[:-1]. The default
+      # loads bring in a trailing-1 stream dim, so Flatten folds that 1 into
+      # the next-inner dim before RepeatRef sees the two streams.
+      E0_load = step.LinearOffChipLoad(
           underlying=E0,
           stride=(1, 1),
           out_shape_tiled=(K_value, 1),
           tile_row=1, tile_col=M_value,
           par_dispatch=1,
       )
-      E1 = step.LinearOffChipLoad(
+      E1_load = step.LinearOffChipLoad(
           underlying=E1,
           stride=(N_value, 1, 1),
           out_shape_tiled=(K_value, N_value, 1),
           tile_row=1, tile_col=M_value,
           par_dispatch=1,
       )
-      # Re-load both inputs without the default trailing-1 stream dim so
-      # the RepeatRef constraint input.shape == ref.shape[:-1] holds.
-      E0_flat = step.LinearOffChipLoad(
-          underlying=E0,
-          stride=(1,),
-          out_shape_tiled=(K_value,),
-          tile_row=1, tile_col=M_value,
-          par_dispatch=1,
-      )
-      E1_flat = step.LinearOffChipLoad(
-          underlying=E1,
-          stride=(N_value, 1),
-          out_shape_tiled=(K_value, N_value),
-          tile_row=1, tile_col=M_value,
-          par_dispatch=1,
-      )
-      # E0_flat.stream = (1, K), E1_flat.stream = (1, K, N), both tile (1, M).
-      E2 = step.RepeatRef(graph, E0_flat, E1_flat)
-      return step.OffChipStore(graph, E2, par_dispatch=1)
+      # Drop the trailing-1: E0 stream (1, K, 1) -> (1, K);
+      # E1 stream (1, K, N, 1) -> (1, K, N). Both tiles stay (1, M).
+      E0_flat = step.Flatten(graph, E0_load, min_rank=0, max_rank=1)
+      E1_flat = step.Flatten(graph, E1_load, min_rank=0, max_rank=1)
+      expanded = step.RepeatRef(graph, E0_flat, E1_flat)
+      return step.OffChipStore(graph, expanded, par_dispatch=1)
 - name: ExpandRef
   desc: |
     Broadcast an input stream's trailing singleton dims to match a ref

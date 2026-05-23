@@ -77,6 +77,14 @@ general:
       - `step.DynLinearOffChipLoad(...)` — dynamic-shape tile streams when
         outer dims aren't known at build time.
 
+    Stride convention (LinearOffChipLoad / DynLinearOffChipLoad /
+    RandomOffChipLoad): `stride` and `out_shape_tiled` define how tile
+    indices map to positions in the underlying tensor's tile grid.
+      - Advancing dim: `stride[i] = grid_cols_per_step` — tiles advance
+        through the grid along this dim.
+      - Broadcast dim: `stride[i] = 0` — same tile replicated along this
+        dim (use when a weight/scale must be repeated across tokens).
+
     Op-call conventions:
       - `write_back_mu=False` for compute and transform ops unless the
         immediate consumer is a `Bufferize` (then `True`).
