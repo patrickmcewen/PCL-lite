@@ -18,6 +18,15 @@ general:
         The codegen emits a `# Inputs:` comment block immediately above your
         `def body(...)` listing each arg's dtype and PCL-lite dims so you can
         choose the right loader.
+      • PCL-lite dims convention: the YAML `dims: [a, b, c]` list is
+        **innermost-first** — `dims[0]` is the innermost (smallest-stride)
+        dim. The actual torch shape is the reverse of the list, so
+        `dims=[K, M]` arrives in the body as a tensor of shape
+        `(M_value, K_value)` and `dims=[N, K, M]` arrives as
+        `(M_value, K_value, N_value)`. Default tiling for
+        `LinearOffChipLoad` uses `tile_col=<innermost dim>=dims[0]`.
+        Do not transpose / swap-stride to "fix" an input — the underlying
+        already matches this convention.
       • Compose `step.*` ops; each compute/transform op takes `graph` as its
         first argument and returns a new node consumed by reference.
       • The body MUST end with `return step.OffChipStore(graph, <last_node>,
@@ -38,8 +47,11 @@ general:
 
     The harness then runs `step.execute(graph, store, input_tensors={})` and
     flat-compares the result (always a 2-D un-tiled tensor) against the
-    reference computed from `data_transform`. Only `numel` and element-wise
-    values are checked; shapes are not enforced.
+    reference computed from `data_transform`. `numel` must match exactly,
+    and the global relative error
+    `max(|out - ref|) / (max(|ref|) + 1e-12) < 1e-5` must hold. This is
+    looser than element-wise `assert_close` so fp32 reductions over large
+    K-tile counts pass; shapes are not enforced.
 
     Module-level symbols available in scope:
       - `step` (the step_tl shim)

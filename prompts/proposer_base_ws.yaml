@@ -18,6 +18,15 @@ general:
         The codegen emits a `# Inputs:` comment block immediately above your
         `def body(...)` listing each arg's dtype and PCL-lite dims so you can
         choose the right loader.
+      • PCL-lite dims convention: the YAML `dims: [a, b, c]` list is
+        **innermost-first** — `dims[0]` is the innermost (smallest-stride)
+        dim. The actual torch shape is the reverse of the list, so
+        `dims=[K, M]` arrives in the body as a tensor of shape
+        `(M_value, K_value)` and `dims=[N, K, M]` arrives as
+        `(M_value, K_value, N_value)`. Default tiling for
+        `LinearOffChipLoad` uses `tile_col=<innermost dim>=dims[0]`.
+        Do not transpose / swap-stride to "fix" an input — the underlying
+        already matches this convention.
       • Compose `step.*` ops; each compute/transform op takes `graph` as its
         first argument and returns a new node consumed by reference.
       • The body MUST end with `return step.OffChipStore(graph, <last_node>,
@@ -38,8 +47,11 @@ general:
 
     The harness then runs `step.execute(graph, store, input_tensors={})` and
     flat-compares the result (always a 2-D un-tiled tensor) against the
-    reference computed from `data_transform`. Only `numel` and element-wise
-    values are checked; shapes are not enforced.
+    reference computed from `data_transform`. `numel` must match exactly,
+    and the global relative error
+    `max(|out - ref|) / (max(|ref|) + 1e-12) < 1e-5` must hold. This is
+    looser than element-wise `assert_close` so fp32 reductions over large
+    K-tile counts pass; shapes are not enforced.
 
     Module-level symbols available in scope:
       - `step` (the step_tl shim)
@@ -157,7 +169,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -207,7 +222,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['W'].unsqueeze(0).expand(K_value, M_value, N_value)
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   W: dtype=fp32, dims=[N, M]
@@ -278,7 +296,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0'][input_data['Mhot'][:, 0] > 0]
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -359,7 +380,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = torch.arange(M_value, dtype=torch.float32)
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     def body(graph, ):
         # MetadataGen: source op for an address / index stream. Stream shape
@@ -412,7 +436,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -469,7 +496,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0'] ** 2
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -525,7 +555,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0'] + input_data['E1']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -600,7 +633,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -657,7 +693,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0'].sum(dim=1)
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, K, M]
@@ -725,7 +764,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['A'] @ input_data['B']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   A: dtype=fp32, dims=[K, M]
@@ -804,7 +846,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -861,7 +906,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -919,7 +967,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0'].unsqueeze(0).expand(N_value, -1)
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[M]
@@ -976,7 +1027,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0'].unsqueeze(1).expand(K_value, N_value, M_value)
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[M, K]
@@ -1050,7 +1104,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0'].unsqueeze(1).expand(M_value, K_value, N_value)
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -1117,7 +1174,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, K, M]
@@ -1172,7 +1232,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, D]
@@ -1229,7 +1292,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = torch.nn.functional.pad(input_data['E0'], (0, 0, 0, N_value - M_value), value=0.0)
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -1296,7 +1362,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -1356,7 +1425,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0'] + input_data['E0']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -1424,7 +1496,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, D]
@@ -1494,7 +1569,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, D]
@@ -1571,7 +1649,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0'][Mhot[:, 0] > 0]
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -1648,7 +1729,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = torch.cat([input_data['E0'], input_data['E1']], dim=0)
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -1730,7 +1814,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = torch.stack([input_data['E0'], input_data['E1']], dim=1).reshape(M_value, 2 * N_value)
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -1824,7 +1911,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -1892,7 +1982,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = torch.arange(M_value, dtype=torch.float32)
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     def body(graph, ):
         # FlatmapCounter expands a scalar tile n into a stream of n
@@ -1963,7 +2056,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = torch.arange(num_tile_per_expert).float() + expert_addr_base + int(expert_onehot.argmax().item()) * num_tile_per_expert
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     def body(graph, ):
         # ExpertAddrGen: given a one-hot expert selector, emit
@@ -2030,7 +2126,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -2102,7 +2201,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -2169,7 +2271,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -2239,7 +2344,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -2303,7 +2411,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -2378,7 +2489,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = W_table
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     def body(graph, ):
         # RandomOffChipLoad: indirect-access gather. The address stream's
@@ -2449,7 +2563,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0']
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -2526,7 +2643,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = W.unsqueeze(0).expand(M_value, K_value, K_value)
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]
@@ -2592,7 +2712,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = torch.zeros(M_value, N_value)
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     def body(graph, ):
         # Source op that emits an all-zeros tensor of the declared stream
@@ -2646,7 +2769,10 @@ ops:
         out = step.execute(graph, out, input_tensors={})
         S0_ref = input_data['E0'].sum(dim=-1)
         assert out.numel() == S0_ref.numel(), f'output S0 numel {out.numel()} != ref {S0_ref.numel()}'
-        torch.testing.assert_close(out.flatten(), S0_ref.flatten())
+        S0_max_err = (out.flatten() - S0_ref.flatten()).abs().max().item()
+        S0_ref_scale = S0_ref.abs().max().item() + 1e-12
+        S0_rel_err = S0_max_err / S0_ref_scale
+        assert S0_rel_err < 1e-5, f'output S0 rel_err={S0_rel_err:.2e} (max_abs_err={S0_max_err:.2e}, ref_scale={S0_ref_scale:.2e})'
 
     # Inputs (raw torch tensors passed positionally to body()):
     #   E0: dtype=fp32, dims=[N, M]

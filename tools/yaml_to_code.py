@@ -11,7 +11,8 @@ The codegen emits a test file with this layout:
         out = step.execute(graph, out, input_tensors={})
         ref0 = <data_transform[0]>
         assert out.numel() == ref0.numel(), ...
-        torch.testing.assert_close(out.flatten(), ref0.flatten())
+        # Global rel-err vs. max-abs ref (StepDB validate_functional style).
+        assert (out - ref0).abs().max() / (ref0.abs().max() + 1e-12) < 1e-5
 
     # `impl:` from the YAML is appended verbatim as `def body(graph, ...):`.
 
@@ -296,8 +297,24 @@ def yaml_to_code(data):
             f"    assert {out_var}.numel() == {name}_ref.numel(), "
             f"f'output {name} numel {{{out_var}.numel()}} != ref {{{name}_ref.numel()}}'"
         )
+        # Global relative-error check vs. max-abs reference (cf.
+        # StepDB/validate_functional.py:validate_kernel). Avoids element-wise
+        # rtol blow-ups on small ref values and absorbs the O(sqrt(K)*eps)
+        # noise that fp32 matmul/reduction picks up against the PyTorch
+        # reference when K is large.
         compare_lines.append(
-            f"    torch.testing.assert_close({out_var}.flatten(), {name}_ref.flatten())"
+            f"    {name}_max_err = ({out_var}.flatten() - {name}_ref.flatten()).abs().max().item()"
+        )
+        compare_lines.append(
+            f"    {name}_ref_scale = {name}_ref.abs().max().item() + 1e-12"
+        )
+        compare_lines.append(
+            f"    {name}_rel_err = {name}_max_err / {name}_ref_scale"
+        )
+        compare_lines.append(
+            f"    assert {name}_rel_err < 1e-5, "
+            f"f'output {name} rel_err={{{name}_rel_err:.2e}} "
+            f"(max_abs_err={{{name}_max_err:.2e}}, ref_scale={{{name}_ref_scale:.2e}})'"
         )
 
     ref_block = "\n".join(ref_lines) if ref_lines else "    # no outputs"
