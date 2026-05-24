@@ -447,7 +447,7 @@ def single_query_py_body(id, prompt, task_str, config_data):
         sample_log = log_sample_response(temp_dir, id, temp.get("message"))
         impl = extract_code(response)
     impl_str = clean_code(impl)
-    temp_test_path = os.path.join(temp_dir, f"test_{id}_{model_name}.py")
+    temp_test_path = os.path.join(temp_dir, f"test_{id}_{yaml_to_code.clean_model_name(model_name)}.py")
     code = task_str + "\n" + impl_str
     with open(temp_test_path, 'w') as file:
         file.write(code)
@@ -545,7 +545,7 @@ def single_query_affine_py_body(id, prompt, task_str, config_data):
     sample_log = log_sample_response(temp_dir, id, temp.get("message"))
     impl = extract_code(response)
     impl_str = clean_code(impl)
-    temp_test_path = os.path.join(temp_dir, f"test_{id}_{model_name}.py")
+    temp_test_path = os.path.join(temp_dir, f"test_{id}_{yaml_to_code.clean_model_name(model_name)}.py")
     code = task_str + "\n" + impl_str
     with open(temp_test_path, 'w') as file:
         file.write(code)
@@ -639,7 +639,7 @@ def single_query_affine_impl(id, prompt, task_data, config_data):
     sample_log = log_sample_response(temp_dir, id, temp.get("message"))
     impl = extract_code(response)
     impl = clean_yaml(impl)
-    temp_test_path = os.path.join(temp_dir, f"test_{id}_{model_name}.py")
+    temp_test_path = os.path.join(temp_dir, f"test_{id}_{yaml_to_code.clean_model_name(model_name)}.py")
     impl_data = yaml.safe_load(impl)
     if impl_data == None:
         log_sample_outcome(sample_log, False, error="Response Format Error: empty/unparsable YAML")

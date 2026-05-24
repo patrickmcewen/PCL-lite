@@ -553,7 +553,7 @@ def clean_python_code(code_string):
 
 def batch_yaml_to_code(task_data, temp_dir, model_name, rounds, prefix):
     for id in range(rounds):
-        temp_test_path = os.path.join(temp_dir, f"test_{id}_{model_name}.py")
+        temp_test_path = os.path.join(temp_dir, f"test_{id}_{clean_model_name(model_name)}.py")
         impl_path = os.path.join(temp_dir, f"{prefix}_{id}.yaml")
         if not os.path.exists(impl_path):
             continue
@@ -573,7 +573,10 @@ def remove_all_py(temp_dir):
 
 
 def clean_model_name(model_name):
-    return model_name.replace(":", "")
+    # Strip characters that make filenames unimportable as Python modules:
+    # ':' (used in some provider model ids), '.' (parsed as submodule
+    # separator by importlib — breaks e.g. qwen-3.6 / kimi-k2.6).
+    return model_name.replace(":", "").replace(".", "_")
 
 
 if __name__ == "__main__":

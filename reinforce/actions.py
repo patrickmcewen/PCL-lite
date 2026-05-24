@@ -170,7 +170,7 @@ def collect_error_to_files(id, config_data):
     # Check is the temp test file exists. If not, create it. Otherwise, read it.
     temp_dir = config_data["temp_dir"]
     model_name = config_data["model_name"]
-    temp_test_path = os.path.join(temp_dir, f"test_{id}_{model_name}.py")
+    temp_test_path = os.path.join(temp_dir, f"test_{id}_{yaml_to_code.clean_model_name(model_name)}.py")
     if not os.path.exists(temp_test_path):
         print(f"{temp_test_path} does not exist")
     result = subprocess.run(
