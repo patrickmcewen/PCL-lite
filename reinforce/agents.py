@@ -111,6 +111,98 @@ def _rhs_rebinds_input(rhs, name):
     return False
 
 
+# --- Static "no banned-torch-ops" gate -----------------------------------
+# Mirrors the torch portion of the StepGenFlow12 orchestrator
+# ``refactor_final`` banned_patterns. The bypass gate above only checks
+# *where* input tensors flow; it deliberately descends past lambdas so
+# that legitimate ``map_fn`` closures aren't flagged for ``input_data[...]``
+# access. That leaves a hole: an impl can pass ``check_body_no_bypass`` by
+# routing inputs into the right ``underlying=`` kwarg, then doing all the
+# real compute inside an immediately-invoked lambda there. This gate
+# walks the whole body AST (including lambda bodies) and rejects any of
+# the banned torch ops. ``torch.tensor`` is whitelisted for the same
+# reason as the orchestrator: list[int] → 1D int tensor for DSL
+# producers like ``metadata_gen``.
+_BANNED_METHODS = {
+    "unsqueeze": "use step.Promote / step.Repeat",
+    "squeeze":   "use step.Flatten",
+    "expand":    "use step.RepeatRef or step.Repeat",
+    "sum":       "use step.Accum with an Add fn, or step.Map with a sum helper",
+    "prod":      "use step.Accum with a Mul fn",
+    "reshape":   "use shape-modifying step ops (step.Flatten, step.Bufferize + step.Streamify)",
+    "view":      "use shape-modifying step ops (step.Flatten, step.Bufferize + step.Streamify)",
+    "permute":   "express permutations via step.Bufferize + step.Streamify",
+    "transpose": "express transposes via step.Bufferize + step.Streamify",
+    "flatten":   "use the step.Flatten op, not the tensor method",
+    "float":     "changing dtype is not allowed",
+    "pow":       "use a step.Map(fn=fn_pow) helper (e.g. fn_square for x**2)",
+    "mean":      "use a step.Map(fn=fn_mean) helper that reduces and divides",
+    "amax":      "use step.Accum / step.Scan with a Max-style fn",
+}
+_BANNED_TORCH_ATTRS = {
+    "matmul": "use a step.Map / step.Accum matmul pattern, not torch.matmul",
+    "eye":    "not allowed",
+    "exp":    "use a step.Map(fn=fn_exp) helper",
+    "rsqrt":  "use a step.Map(fn=fn_rsqrt) helper",
+    "cat":    "concatenation is not part of the step DSL surface; restructure the computation (e.g. step.Merge for stream-level joins) instead of torch.cat",
+}
+_BANNED_F_ATTRS = {
+    "silu":   "use a step.Map(fn=fn_silu) helper",
+}
+# Two standalone banned constructs — caught by AST node type rather
+# than by name. ``@`` is the pytorch matmul operator (same compute
+# path as ``torch.matmul``). ``lambda`` is the standard cheat vector:
+# wrap an entire torch computation in a closure passed as
+# ``underlying=`` so the bypass gate's input-flow check is satisfied
+# while the real compute runs inside. Legitimate PCL-lite impls use
+# named ``fn_xxx`` helpers with ``step.Map(fn=...)``, never lambdas.
+_BANNED_BINOP_MSG = (
+    "use step.Map / step.Accum matmul pattern, not the `@` operator"
+)
+_BANNED_LAMBDA_MSG = (
+    "step ops take named helper functions (def fn_xxx) via "
+    "step.Map(fn=fn_xxx); a `lambda` in the impl body is the standard "
+    "vector for smuggling raw torch compute past the bypass gate"
+)
+
+
+def check_body_no_banned_torch(body_src):
+    """Reject impls that compute the answer with banned torch ops.
+    Walks the whole body AST — including lambda bodies, where the
+    typical cheat lives — and returns ``None`` if clean, else a
+    one-line message describing the first violation."""
+    indented = "\n".join("    " + line for line in body_src.split("\n"))
+    wrapped = "def __body__():\n" + indented + "\n    pass\n"
+    try:
+        tree = ast.parse(wrapped)
+    except SyntaxError as e:
+        return f"body does not parse: {e}"
+    for node in ast.walk(tree):
+        # Subtract 1 for the synthetic `def __body__():` wrapper line.
+        lineno = max(getattr(node, "lineno", 2) - 1, 1)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.MatMult):
+            return f"banned `@` (matmul) at body line {lineno}: {_BANNED_BINOP_MSG}."
+        if isinstance(node, ast.Lambda):
+            return f"banned `lambda` at body line {lineno}: {_BANNED_LAMBDA_MSG}."
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        attr = node.func.attr
+        if attr in _BANNED_METHODS:
+            return (f"banned tensor method `.{attr}(...)` at body line "
+                    f"{lineno}: {_BANNED_METHODS[attr]}.")
+        if (isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "torch"
+                and attr in _BANNED_TORCH_ATTRS):
+            return (f"banned `torch.{attr}` at body line {lineno}: "
+                    f"{_BANNED_TORCH_ATTRS[attr]}.")
+        if (isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "F"
+                and attr in _BANNED_F_ATTRS):
+            return (f"banned `F.{attr}` at body line {lineno}: "
+                    f"{_BANNED_F_ATTRS[attr]}.")
+    return None
+
+
 def check_body_no_bypass(body_src, input_names):
     """Reject bodies that bypass STeP by computing the answer in plain
     torch and wrapping the final tensor in a source op. Returns ``None``
@@ -317,6 +409,10 @@ def single_query_impl(id, prompt, task_data, config_data):
     bypass = check_body_no_bypass(impl_data.get("impl", ""), input_names)
     if bypass:
         log_sample_outcome(sample_log, False, error=f"Bypass: {bypass}")
+        return (pytest.ExitCode.TESTS_FAILED, impl_data, temp["usage"])
+    banned = check_body_no_banned_torch(impl_data.get("impl", ""))
+    if banned:
+        log_sample_outcome(sample_log, False, error=f"Banned torch op: {banned}")
         return (pytest.ExitCode.TESTS_FAILED, impl_data, temp["usage"])
     data = {**task_data, **impl_data}
     code = yaml_to_code.yaml_to_code(data)
@@ -650,6 +746,10 @@ def single_query_affine_impl(id, prompt, task_data, config_data):
     bypass = check_body_no_bypass(impl_data.get("impl", ""), input_names)
     if bypass:
         log_sample_outcome(sample_log, False, error=f"Bypass: {bypass}")
+        return (False, impl_data, temp["usage"])
+    banned = check_body_no_banned_torch(impl_data.get("impl", ""))
+    if banned:
+        log_sample_outcome(sample_log, False, error=f"Banned torch op: {banned}")
         return (False, impl_data, temp["usage"])
     data = {**task_data, **impl_data}
     code = yaml_to_code.yaml_to_code(data)

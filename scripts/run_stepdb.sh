@@ -15,9 +15,9 @@ set -euo pipefail
 
 # --- defaults -----------------------------------------------------------
 BENCHCARD="experiments/benchmark_stepdb_full_bench_set.csv"
-MODEL="qwen-3.6"
+MODEL="gpt-oss-120b"
 TAG=""                              # auto-derived from benchcard if unset
-SAMPLES=4
+SAMPLES=64
 TEMPERATURE=0.7
 MAX_TOKENS=200000
 NUM_GROUPS=1
